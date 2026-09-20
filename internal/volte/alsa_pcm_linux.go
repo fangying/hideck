@@ -3,6 +3,7 @@
 package volte
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"sync"
@@ -98,8 +99,18 @@ func (p *alsaPCM) ReadFrame() ([]int16, error) {
 		return nil, fmt.Errorf("volte: capture closed")
 	}
 	buf := make([]byte, pcmuFrameSamples*2)
-	if _, err := capt.Read(buf); err != nil {
+	n, err := capt.Read(buf)
+	if errors.Is(err, unix.EPIPE) {
+		if prepareErr := ioctl(capt, alsaIoctlPrepare, nil); prepareErr != nil {
+			return nil, fmt.Errorf("volte: recover ALSA capture XRUN: %w", prepareErr)
+		}
+		n, err = capt.Read(buf)
+	}
+	if err != nil {
 		return nil, err
+	}
+	if n != len(buf) {
+		return nil, fmt.Errorf("volte: ALSA capture short read: %d/%d bytes", n, len(buf))
 	}
 	out := make([]int16, pcmuFrameSamples)
 	for i := 0; i < pcmuFrameSamples; i++ {
@@ -123,8 +134,20 @@ func (p *alsaPCM) WriteFrame(samples []int16) error {
 		buf[i*2] = byte(v)
 		buf[i*2+1] = byte(v >> 8)
 	}
-	_, err := play.Write(buf)
-	return err
+	n, err := play.Write(buf)
+	if errors.Is(err, unix.EPIPE) {
+		if prepareErr := ioctl(play, alsaIoctlPrepare, nil); prepareErr != nil {
+			return fmt.Errorf("volte: recover ALSA playback XRUN: %w", prepareErr)
+		}
+		n, err = play.Write(buf)
+	}
+	if err != nil {
+		return err
+	}
+	if n != len(buf) {
+		return fmt.Errorf("volte: ALSA playback short write: %d/%d bytes", n, len(buf))
+	}
+	return nil
 }
 
 func (p *alsaPCM) captureFile() *os.File {

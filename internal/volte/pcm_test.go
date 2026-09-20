@@ -116,6 +116,59 @@ func TestPCMBridgeCloseReleases(t *testing.T) {
 	}
 }
 
+func TestSwitchablePCMActivatesAfterAnswer(t *testing.T) {
+	dynamic := &switchablePCM{}
+
+	before, err := dynamic.ReadFrame()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(before) != pcmuFrameSamples || pcmNonZero(before) != 0 {
+		t.Fatalf("inactive frame len=%d nonzero=%d", len(before), pcmNonZero(before))
+	}
+	if err := dynamic.WriteFrame(nonzeroFrame()); err != nil {
+		t.Fatal(err)
+	}
+
+	real := &memPCM{toRead: [][]int16{nonzeroFrame()}}
+	if err := dynamic.Replace(real); err != nil {
+		t.Fatal(err)
+	}
+	after, err := dynamic.ReadFrame()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pcmNonZero(after) == 0 {
+		t.Fatal("activated PCM returned silence")
+	}
+	if err := dynamic.WriteFrame(nonzeroFrame()); err != nil {
+		t.Fatal(err)
+	}
+	if real.writtenCount() != 1 {
+		t.Fatalf("activated PCM writes=%d want 1", real.writtenCount())
+	}
+	if err := dynamic.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if !real.isClosed() {
+		t.Fatal("activated PCM was not closed")
+	}
+}
+
+func TestSwitchablePCMClosesLateReplacement(t *testing.T) {
+	dynamic := &switchablePCM{}
+	if err := dynamic.Close(); err != nil {
+		t.Fatal(err)
+	}
+	late := &memPCM{}
+	if err := dynamic.Replace(late); err != nil {
+		t.Fatal(err)
+	}
+	if !late.isClosed() {
+		t.Fatal("replacement after close was not closed")
+	}
+}
+
 func nonzeroFrame() []int16 {
 	out := make([]int16, pcmuFrameSamples)
 	for i := range out {

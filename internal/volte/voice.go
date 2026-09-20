@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -27,7 +28,16 @@ const (
 	qmiCallSetup         qmi.VoiceCallState     = 0x09
 	qmiDirMO             qmi.VoiceCallDirection = 0x01
 	qmiDirMT             qmi.VoiceCallDirection = 0x02
+	incomingActivePoll                          = 100 * time.Millisecond
+	incomingActiveBudget                        = 3 * time.Second
+	atVoiceStatusPoll                           = 500 * time.Millisecond
+	atVoiceStatusTimeout                        = 2 * time.Second
+	atVoiceMissingBudget                        = 6
 )
+
+type atVoiceStatusHost interface {
+	UseATVoiceStatus(deviceID string) bool
+}
 
 type qmiTombstone struct {
 	Peer      string
@@ -43,6 +53,7 @@ type voiceSession struct {
 	incomingSeen  map[string]bool
 	recentlyEnded map[uint8]qmiTombstone
 	attached      bool
+	attachedGen   uint64
 	incoming      []func(voicehost.IncomingCall)
 	events        []func(voicehost.CallEvent)
 }
@@ -80,11 +91,18 @@ func (c *Controller) attachVoice(deviceID string) {
 		s.voice = newVoiceSession()
 	}
 	vs := s.voice
-	first := !vs.attached
+	first := !vs.attached || vs.attachedGen != s.gen
 	vs.attached = true
+	vs.attachedGen = s.gen
 	gen := s.gen
 	c.mu.Unlock()
 	if first {
+		if host, ok := c.host.(atVoiceStatusHost); ok && host.UseATVoiceStatus(deviceID) {
+			// CLCC and QMI call IDs/snapshots are not interchangeable on QDC507.
+			// A QMI snapshot can omit a ringing AT call and falsely cancel it.
+			go c.pollATVoiceStatus(deviceID, vs, gen)
+			return
+		}
 		_ = c.host.OnVoiceStatus(deviceID, func(info *qmi.VoiceAllCallInfo) {
 			if !c.generationLive(deviceID, gen) {
 				return
@@ -95,9 +113,148 @@ func (c *Controller) attachVoice(deviceID string) {
 	c.ReconcileCalls(context.Background(), deviceID)
 }
 
+// pollATVoiceStatus mirrors the proven MaVo/DJOneHub QDC507 control path:
+// AT+CLCC is authoritative for call discovery and state, while QMI remains the
+// registration/data channel. The generation check stops the poller when the
+// VoLTE session is disabled or recreated.
+func (c *Controller) pollATVoiceStatus(deviceID string, vs *voiceSession, gen uint64) {
+	logger.Info("QDC507 AT call monitor started", "device", deviceID, "generation", gen)
+	defer logger.Info("QDC507 AT call monitor stopped", "device", deviceID, "generation", gen)
+	missing := 0
+	hadVoice := false
+	poll := func() {
+		if !c.generationLive(deviceID, gen) {
+			return
+		}
+		response, err := c.host.ExecuteAT(deviceID, "AT+CLCC", atVoiceStatusTimeout)
+		if !c.generationLive(deviceID, gen) {
+			return
+		}
+		info := parseCLCCVoiceInfo(response)
+		if len(info.Calls) > 0 {
+			missing = 0
+			hadVoice = true
+			// Some QDC507 firmware appends +CME ERROR: 100 after valid CLCC
+			// records while an incoming call is being set up. The records are
+			// still authoritative and must not be discarded with the trailer.
+			c.handleVoiceInfo(deviceID, vs, info)
+			return
+		}
+		if err != nil {
+			return
+		}
+		if hadVoice {
+			missing++
+			if missing < atVoiceMissingBudget {
+				return
+			}
+			hadVoice = false
+			missing = 0
+		}
+		c.handleVoiceInfo(deviceID, vs, info)
+	}
+	poll()
+	ticker := time.NewTicker(atVoiceStatusPoll)
+	defer ticker.Stop()
+	for range ticker.C {
+		if !c.generationLive(deviceID, gen) {
+			return
+		}
+		poll()
+	}
+}
+
+func parseCLCCVoiceInfo(response string) *qmi.VoiceAllCallInfo {
+	info := &qmi.VoiceAllCallInfo{}
+	normalized := strings.ReplaceAll(strings.ReplaceAll(response, "\r\n", "\n"), "\r", "\n")
+	for _, line := range strings.Split(normalized, "\n") {
+		marker := strings.Index(line, "+CLCC:")
+		if marker < 0 {
+			continue
+		}
+		fields := splitCLCCFields(strings.TrimSpace(line[marker+len("+CLCC:"):]))
+		if len(fields) < 5 || strings.TrimSpace(fields[3]) != "0" {
+			continue
+		}
+		id, idErr := strconv.ParseUint(strings.TrimSpace(fields[0]), 10, 8)
+		direction, directionErr := strconv.Atoi(strings.TrimSpace(fields[1]))
+		state, stateErr := strconv.Atoi(strings.TrimSpace(fields[2]))
+		if idErr != nil || directionErr != nil || stateErr != nil {
+			continue
+		}
+		qmiDirection := qmiDirMO
+		if direction == 1 {
+			qmiDirection = qmiDirMT
+		} else if direction != 0 {
+			continue
+		}
+		qmiState, ok := clccVoiceState(state)
+		if !ok {
+			continue
+		}
+		callID := uint8(id)
+		info.Calls = append(info.Calls, qmi.VoiceCallInfo{
+			ID: callID, State: qmiState, Direction: qmiDirection, Mode: qmi.VoiceCallModeLTE,
+		})
+		if len(fields) > 5 {
+			number := strings.Trim(strings.TrimSpace(fields[5]), "\"")
+			if number != "" {
+				info.RemotePartyNumbers = append(info.RemotePartyNumbers, qmi.VoiceRemotePartyNumber{
+					CallID: callID, Number: number,
+				})
+			}
+		}
+	}
+	return info
+}
+
+func splitCLCCFields(value string) []string {
+	fields := make([]string, 0, 8)
+	var field strings.Builder
+	quoted := false
+	for _, r := range value {
+		switch {
+		case r == '"':
+			quoted = !quoted
+			field.WriteRune(r)
+		case r == ',' && !quoted:
+			fields = append(fields, strings.TrimSpace(field.String()))
+			field.Reset()
+		default:
+			field.WriteRune(r)
+		}
+	}
+	fields = append(fields, strings.TrimSpace(field.String()))
+	return fields
+}
+
+func clccVoiceState(state int) (qmi.VoiceCallState, bool) {
+	switch state {
+	case 0:
+		return qmiCallConversation, true
+	case 1:
+		return qmiCallHolding, true
+	case 2:
+		return qmiCallOriginating, true
+	case 3:
+		return qmiCallAlerting, true
+	case 4:
+		return qmiCallIncoming, true
+	case 5:
+		return qmiCallWaiting, true
+	case 6:
+		return qmiCallDisconnecting, true
+	default:
+		return 0, false
+	}
+}
+
 func (c *Controller) ReconcileCalls(ctx context.Context, deviceID string) {
 	if c == nil || c.host == nil {
 		return
+	}
+	if host, ok := c.host.(atVoiceStatusHost); ok && host.UseATVoiceStatus(deviceID) {
+		return // The serialized CLCC poller owns reconciliation for this device.
 	}
 	if ctx == nil {
 		ctx = context.Background()
@@ -206,7 +363,13 @@ func (c *Controller) BeginCall(ctx context.Context, request voicehost.BeginCallR
 	if id == "" {
 		id = newPersistentCallID(deviceID, qmiID)
 	}
-	media, mediaErr := startCallMedia(request.SDP, c.callPCM(deviceID), sdpHasRecvOnly(request.SDP))
+	var media *callMedia
+	var mediaErr error
+	if c.managedRoute(deviceID) {
+		media, mediaErr = startDeferredCallMedia(request.SDP, sdpHasRecvOnly(request.SDP))
+	} else {
+		media, mediaErr = startCallMedia(request.SDP, c.callPCM(deviceID), sdpHasRecvOnly(request.SDP))
+	}
 	sdp := ""
 	if mediaErr != nil {
 		logger.Warn("VoLTE 媒体端点未建立", "device", deviceID, "err", mediaErr)
@@ -216,6 +379,9 @@ func (c *Controller) BeginCall(ctx context.Context, request voicehost.BeginCallR
 	}
 	nc := nativeCall{ID: id, QMI: qmiID, Direction: "outbound", Peer: request.Callee, State: "calling", Start: now, ClientSDP: sdp}
 	c.storeCall(deviceID, nc)
+	if c.managedRoute(deviceID) {
+		go c.activateManagedOutbound(deviceID, id)
+	}
 	c.mu.Lock()
 	vs := (*voiceSession)(nil)
 	if s := c.sess[deviceID]; s != nil {
@@ -277,7 +443,145 @@ func (c *Controller) AnswerIncomingCall(ctx context.Context, request voicehost.A
 	if err := c.host.VOICEAnswer(ctx, request.DeviceID, call.QMI); err != nil {
 		return voicehost.AnswerResult{}, err
 	}
+	completed := false
+	defer func() {
+		if !completed && c.managedRoute(request.DeviceID) {
+			cleanup, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			if err := c.HangupCall(cleanup, request.DeviceID, call.ID); err != nil {
+				logger.Warn("QDC507 audio failure hangup failed", "device", request.DeviceID, "err", err)
+			}
+		}
+	}()
+
+	// QDC507 accepts the call through USB AT (ATA), while its QMI voice state
+	// can remain stuck at INCOMING. Treat a successful ATA as authoritative so
+	// the UI and call history do not remain in the ringing/missed state.
+	call.State = "connected"
+	c.storeCall(request.DeviceID, call)
+
+	// The modem UAC stream is not usable while the call is ringing. QMI can
+	// remain stale on QDC507, so use the AT call state (as MaVo/DJOneHub do) to
+	// decide when the call is active. The bounded fallback still permits audio
+	// on firmware variants that omit CLCC indications.
+	if !c.waitIncomingCallActive(ctx, request.DeviceID, call.QMI, incomingActiveBudget) {
+		if h, ok := c.host.(atVoiceStatusHost); ok && h.UseATVoiceStatus(request.DeviceID) {
+			return voicehost.AnswerResult{}, errors.New("volte: ATA completed but QDC507 active voice call was not confirmed")
+		}
+		logger.Warn("VoLTE 来电接听后未确认 CLCC active，降级启用模组声卡", "device", request.DeviceID)
+	}
+	if _, active := c.lookup(request.DeviceID, call.ID); !active {
+		return voicehost.AnswerResult{}, errors.New("volte: call ended while preparing audio")
+	}
+	if media := c.media.get(call.ID); media != nil {
+		var pcm PCMPort
+		if c.managedRoute(request.DeviceID) {
+			var err error
+			pcm, err = c.managedCallPCM(ctx, request.DeviceID, call.ID)
+			if err != nil {
+				return voicehost.AnswerResult{}, err
+			}
+		} else {
+			pcm = c.callPCM(request.DeviceID)
+		}
+		if err := media.activatePCM(pcm); err != nil {
+			return voicehost.AnswerResult{}, err
+		}
+	} else if c.managedRoute(request.DeviceID) {
+		return voicehost.AnswerResult{}, errors.New("volte: incoming media endpoint disappeared")
+	}
+	// Publish the connected event after the media route is active. If QMI
+	// already reported CONVERSATION, markEmitted suppresses the duplicate.
+	if _, active := c.lookup(request.DeviceID, call.ID); active {
+		vs := c.sessionVoice(request.DeviceID)
+		if vs != nil && vs.markEmitted(call.ID, rankKey("connected")) {
+			c.emitEvent(request.DeviceID, voicehost.CallEvent{
+				Type: "CallAnswered", DeviceID: request.DeviceID, CallID: call.ID,
+				Caller: call.Peer, Callee: call.Peer, Direction: call.Direction,
+				State: "connected", Time: time.Now(), AudioCodec: call.Codec,
+				RecordingError: audioError(c.Status(request.DeviceID)),
+			})
+			if c.audio != nil {
+				if err := c.audio.Start(request.DeviceID, call.ID); err != nil {
+					c.setError(request.DeviceID, err)
+				}
+			}
+		}
+	}
+	completed = true
 	return voicehost.AnswerResult{CallID: call.ID, State: "connected"}, nil
+}
+
+func waitAudioRoute(ctx context.Context, budget time.Duration, ready func() bool) error {
+	timer := time.NewTimer(budget)
+	defer timer.Stop()
+	ticker := time.NewTicker(100 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if ready() {
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-timer.C:
+			return context.DeadlineExceeded
+		case <-ticker.C:
+		}
+	}
+}
+
+func (c *Controller) waitIncomingCallActive(ctx context.Context, deviceID string, callID uint8, budget time.Duration) bool {
+	if budget <= 0 {
+		return false
+	}
+	deadline := time.NewTimer(budget)
+	defer deadline.Stop()
+	for {
+		response, err := c.host.ExecuteAT(deviceID, "AT+CLCC", time.Second)
+		active := clccHasActiveCall(response)
+		if h, ok := c.host.(atVoiceStatusHost); ok && h.UseATVoiceStatus(deviceID) {
+			active = clccHasActiveVoiceID(response, callID)
+		}
+		if err == nil && active {
+			return true
+		}
+		timer := time.NewTimer(incomingActivePoll)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return false
+		case <-deadline.C:
+			timer.Stop()
+			return false
+		case <-timer.C:
+		}
+	}
+}
+
+func clccHasActiveVoiceID(response string, callID uint8) bool {
+	info := parseCLCCVoiceInfo(response)
+	return len(info.Calls) == 1 && info.Calls[0].ID == callID && info.Calls[0].State == qmiCallConversation
+}
+
+func clccHasActiveCall(response string) bool {
+	for _, line := range strings.Split(strings.ReplaceAll(response, "\r\n", "\n"), "\n") {
+		marker := strings.Index(line, "+CLCC:")
+		if marker < 0 {
+			continue
+		}
+		fields := strings.Split(strings.TrimSpace(line[marker+len("+CLCC:"):]), ",")
+		// 3GPP +CLCC fields are: id, dir, stat, mode, mpty, ... .
+		// The modem also reports active packet-data sessions (mode=1), so an
+		// active status alone is not evidence that the voice path is ready.
+		if len(fields) >= 4 && strings.TrimSpace(fields[2]) == "0" && strings.TrimSpace(fields[3]) == "0" {
+			return true
+		}
+	}
+	return false
 }
 
 func (c *Controller) RejectIncomingCall(request voicehost.RejectRequest) error {
@@ -510,7 +814,7 @@ func (c *Controller) handleVoiceInfo(deviceID string, vs *voiceSession, info *qm
 		vs.put(next)
 		if dir == "inbound" && vs.markIncoming(id) {
 			if next.ClientSDP == "" {
-				if media, err := startCallMedia("", c.callPCM(deviceID), false); err == nil {
+				if media, err := startDeferredCallMedia("", false); err == nil {
 					next.ClientSDP = media.sdp
 					vs.put(next)
 					c.media.put(id, media)
@@ -689,10 +993,18 @@ func openALSAPCMBounded(device string, budget time.Duration) (PCMPort, error) {
 		pcm PCMPort
 		err error
 	}
-	ch := make(chan result, 1)
+	ch := make(chan result)
+	expired := make(chan struct{})
+	defer close(expired)
 	go func() {
 		pcm, err := openALSAPCM(device)
-		ch <- result{pcm: pcm, err: err}
+		select {
+		case ch <- result{pcm: pcm, err: err}:
+		case <-expired:
+			if pcm != nil {
+				_ = pcm.Close()
+			}
+		}
 	}()
 	timer := time.NewTimer(budget)
 	defer timer.Stop()
@@ -730,6 +1042,7 @@ func (c *Controller) callPCM(deviceID string) PCMPort {
 			"device", deviceID, "alsa", dev, "err", err)
 		return nullPCM{}
 	}
+	logger.Info("VoLTE 已打开真实 ALSA 声卡", "device", deviceID, "alsa", dev)
 	return pcm
 }
 

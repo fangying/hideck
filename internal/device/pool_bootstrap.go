@@ -566,6 +566,12 @@ func (p *Pool) AddWorkerFromConfig(devCfg config.DeviceConfig) (*Worker, error) 
 
 	if backendMode == backend.BackendQMI {
 		w.smsMode = smsModeQMI
+		// The QDC507 voice AT runtime must never consume/read SMS URCs; QMI is
+		// authoritative for SMS. It owns the tty only to serialize RING/CLIP,
+		// CLCC and ATA/ATD/ATH on firmware with unreliable QMI VOICE events.
+		if m.IsVoiceAuxiliary() {
+			m.SetDisableURCRead(true)
+		}
 		if smsCore := w.smsQMICore(); smsCore != nil {
 			smsCore.OnNewSMSWithStorage(func(storage uint8, index uint32) {
 				logger.Info(fmt.Sprintf("[%s] 收到 QMI 短信 URC 通知", w.ID), "index", index, "storage", storage)
@@ -581,7 +587,8 @@ func (p *Pool) AddWorkerFromConfig(devCfg config.DeviceConfig) (*Worker, error) 
 				w.handleNewSMSRawQMI(info)
 			})
 		}
-		// 纯 QMI 模式不监听 AT URC；AT 口仅保留给人工 AT 终端。
+		// Ordinary pure QMI devices do not listen to AT URCs. QDC507 is the
+		// exception: its resident voice auxiliary consumes call URCs only.
 	} else {
 		configureWorkerATSMS(w)
 	}

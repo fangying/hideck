@@ -7,7 +7,9 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/pion/rtp"
 	"github.com/yibaiba/hideck/internal/phone"
+	"github.com/yibaiba/hideck/pkg/logger"
 )
 
 const (
@@ -25,21 +27,23 @@ type PCMPort interface {
 }
 
 type PCMBridge struct {
-	conn       net.PacketConn
-	remoteMu   sync.Mutex
-	remote     net.Addr
-	pcm        PCMPort
-	listenOnly bool
-	closed     chan struct{}
-	closeOnce  sync.Once
-	workers    sync.WaitGroup
-	seq        uint16
-	ts         uint32
-	toPCM      atomic.Uint64
-	fromPCM    atomic.Uint64
-	silent     atomic.Uint64
-	lost       atomic.Uint64
-	overflow   atomic.Uint64
+	conn        net.PacketConn
+	remoteMu    sync.Mutex
+	remote      net.Addr
+	pcm         PCMPort
+	listenOnly  bool
+	closed      chan struct{}
+	closeOnce   sync.Once
+	workers     sync.WaitGroup
+	seq         uint16
+	ts          uint32
+	toPCM       atomic.Uint64
+	fromPCM     atomic.Uint64
+	readErrors  atomic.Uint64
+	writeErrors atomic.Uint64
+	silent      atomic.Uint64
+	lost        atomic.Uint64
+	overflow    atomic.Uint64
 }
 
 func NewPCMBridge(conn net.PacketConn, remote net.Addr, pcm PCMPort, listenOnly bool) *PCMBridge {
@@ -122,10 +126,17 @@ func (b *PCMBridge) downlink() {
 			continue
 		}
 		if err := b.pcm.WriteFrame(pcm); err != nil {
+			count := b.writeErrors.Add(1)
+			if count <= 5 || count%100 == 0 {
+				logger.Warn("VoLTE PCM 下行 ALSA 写入失败", "errors", count, "err", err)
+			}
 			b.overflow.Add(1)
 			continue
 		}
-		b.toPCM.Add(1)
+		count := b.toPCM.Add(1)
+		if count%100 == 0 {
+			logger.Info("VoLTE PCM 下行样本诊断", "frames", count, "nonzero", pcmNonZero(pcm), "peak", pcmPeak(pcm))
+		}
 	}
 }
 
@@ -148,10 +159,17 @@ func (b *PCMBridge) uplink() {
 			} else {
 				frame, err := b.pcm.ReadFrame()
 				if err != nil {
+					count := b.readErrors.Add(1)
+					if count <= 5 || count%100 == 0 {
+						logger.Warn("VoLTE PCM 上行 ALSA 读取失败", "errors", count, "err", err)
+					}
 					b.lost.Add(1)
 				} else {
 					copy(samples, frame)
-					b.fromPCM.Add(1)
+					count := b.fromPCM.Add(1)
+					if count%100 == 0 {
+						logger.Info("VoLTE PCM 上行样本诊断", "frames", count, "nonzero", pcmNonZero(frame), "peak", pcmPeak(frame))
+					}
 				}
 			}
 			payload := phone.EncodePCMU(samples)
@@ -165,19 +183,36 @@ func (b *PCMBridge) uplink() {
 	}
 }
 
+func pcmNonZero(samples []int16) int {
+	n := 0
+	for _, sample := range samples {
+		if sample != 0 {
+			n++
+		}
+	}
+	return n
+}
+
+func pcmPeak(samples []int16) int {
+	peak := 0
+	for _, sample := range samples {
+		value := int(sample)
+		if value < 0 {
+			value = -value
+		}
+		if value > peak {
+			peak = value
+		}
+	}
+	return peak
+}
+
 func rtpPCMUPayload(pkt []byte) ([]byte, bool) {
-	if len(pkt) < 12 {
+	var packet rtp.Packet
+	if err := packet.Unmarshal(pkt); err != nil || packet.Version != 2 || packet.PayloadType != pcmuPayloadType {
 		return nil, false
 	}
-	cc := int(pkt[0] & 0x0f)
-	header := 12 + 4*cc
-	if len(pkt) < header {
-		return nil, false
-	}
-	if pkt[1]&0x7f != pcmuPayloadType {
-		return nil, false
-	}
-	return pkt[header:], true
+	return packet.Payload, true
 }
 
 func encodePCMURTP(seq uint16, ts uint32, payload []byte) []byte {

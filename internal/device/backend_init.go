@@ -10,8 +10,12 @@ import (
 )
 
 func newWorkerModem(cfg config.DeviceConfig, backendMode string) (*modem.Manager, error) {
-	if backend.NormalizeBackendMode(backendMode) == backend.BackendMBIM {
+	normalized := backend.NormalizeBackendMode(backendMode)
+	if normalized == backend.BackendMBIM {
 		return modem.NewSMSAuxiliary(cfg)
+	}
+	if normalized == backend.BackendQMI && isBaiwangUSB(strings.TrimSpace(cfg.USBPath)) {
+		return modem.NewVoiceAuxiliary(cfg)
 	}
 	return modem.New(cfg)
 }

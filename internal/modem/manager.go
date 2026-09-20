@@ -16,11 +16,11 @@ import (
 	"time"
 	"unicode/utf16"
 
+	"github.com/warthog618/sms/encoding/gsm7"
 	"github.com/yibaiba/hideck/internal/apduarbiter"
 	"github.com/yibaiba/hideck/internal/config"
 	"github.com/yibaiba/hideck/pkg/logger"
 	"github.com/yibaiba/hideck/pkg/smscodec"
-	"github.com/warthog618/sms/encoding/gsm7"
 
 	"go.bug.st/serial"
 )
@@ -176,6 +176,13 @@ func New(cfg config.DeviceConfig) (*Manager, error) {
 // owned by the MBIM backend.
 func NewSMSAuxiliary(cfg config.DeviceConfig) (*Manager, error) {
 	return newManager(cfg, runtimeRoleSMSAuxiliary)
+}
+
+// NewVoiceAuxiliary creates a persistent, serialized AT runtime for a QMI
+// modem whose call indications/control are exposed only on the AT port.
+// QMI remains the owner of data, registration, SIM and SMS.
+func NewVoiceAuxiliary(cfg config.DeviceConfig) (*Manager, error) {
+	return newManager(cfg, runtimeRoleVoiceAuxiliary)
 }
 
 func newManager(cfg config.DeviceConfig, role runtimeRole) (*Manager, error) {
@@ -927,12 +934,12 @@ func (m *Manager) initModem() {
 	}
 
 	m.markReady()
-	if m.role == runtimeRoleSMSAuxiliary {
+	if m.role == runtimeRoleSMSAuxiliary || m.role == runtimeRoleVoiceAuxiliary {
 		if err := m.InitializationError(); err != nil {
-			logger.Error(fmt.Sprintf("[%s] MBIM 短信辅助 AT 管理器初始化失败", m.cfg.ID), "port", m.atPort, "err", err)
+			logger.Error(fmt.Sprintf("[%s] 辅助 AT 管理器初始化失败", m.cfg.ID), "port", m.atPort, "err", err)
 			return
 		}
-		logger.Info(fmt.Sprintf("[%s] MBIM 短信辅助 AT 管理器初始化完成", m.cfg.ID), "port", m.atPort)
+		logger.Info(fmt.Sprintf("[%s] 辅助 AT 管理器初始化完成", m.cfg.ID), "port", m.atPort, "voice", m.role == runtimeRoleVoiceAuxiliary)
 		return
 	}
 

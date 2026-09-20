@@ -2,8 +2,10 @@ package device
 
 import (
 	"context"
+	"encoding/csv"
 	"errors"
 	"fmt"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -177,6 +179,12 @@ func (p *Pool) ExecuteAT(deviceID, cmd string, timeout time.Duration) (string, e
 	if w == nil {
 		return "", fmt.Errorf("设备 %s 不存在", deviceID)
 	}
+	// QMI devices with cellular calling keep a resident AT manager. Reuse its
+	// serialized command scheduler; opening a second tty reader makes CEREG,
+	// COPS and call URCs fail with "serial port busy".
+	if w.Modem != nil && w.Modem.CanExecuteAT() {
+		return w.Modem.ExecuteAT(cmd, timeout)
+	}
 	port := strings.TrimSpace(w.ResolvedATPort())
 	if port == "" {
 		return "", fmt.Errorf("设备 %s 没有 AT 口", deviceID)
@@ -305,10 +313,34 @@ func (p *Pool) USBAudioUnusable(deviceID string) bool {
 	return modemUACUnusable(w.Config.USBPath)
 }
 
+func (p *Pool) USBResidentAudioReady(deviceID string) bool {
+	w := p.GetWorker(deviceID)
+	if w == nil {
+		return false
+	}
+	return qdc507ResidentAudioReady(w.Config.USBPath)
+}
+
 func (p *Pool) VOICEDial(ctx context.Context, deviceID, number string) (uint8, error) {
 	w := p.GetWorker(deviceID)
 	if w == nil || w.QMICore == nil {
 		return 0, fmt.Errorf("设备 %s 没有 QMI VOICE", deviceID)
+	}
+	if p.useQDC507ATVoice(w) {
+		if err := p.executeQDC507VoiceAT(deviceID, fmt.Sprintf("ATD%s;", number), 60*time.Second); err != nil {
+			return 0, err
+		}
+		callID, err := p.findATVoiceCallID(ctx, w, number)
+		if err != nil {
+			// Do not report a successful call with the sentinel QMI ID 0: the
+			// voice controller would be unable to reconcile later QMI events.
+			cleanupErr := p.executeQDC507VoiceAT(deviceID, "ATH", 3*time.Second)
+			if cleanupErr != nil {
+				return 0, errors.Join(err, fmt.Errorf("清理未关联的 AT 呼叫失败: %w", cleanupErr))
+			}
+			return 0, err
+		}
+		return callID, nil
 	}
 	return w.QMICore.VOICEDialCall(ctx, number)
 }
@@ -317,6 +349,9 @@ func (p *Pool) VOICEAnswer(ctx context.Context, deviceID string, callID uint8) e
 	w := p.GetWorker(deviceID)
 	if w == nil || w.QMICore == nil {
 		return fmt.Errorf("设备 %s 没有 QMI VOICE", deviceID)
+	}
+	if p.useQDC507ATVoice(w) {
+		return p.executeQDC507VoiceAT(deviceID, "ATA", 5*time.Second)
 	}
 	_, err := w.QMICore.VOICEAnswerCall(ctx, callID)
 	return err
@@ -327,8 +362,135 @@ func (p *Pool) VOICEHangup(ctx context.Context, deviceID string, callID uint8) e
 	if w == nil || w.QMICore == nil {
 		return fmt.Errorf("设备 %s 没有 QMI VOICE", deviceID)
 	}
+	if p.useQDC507ATVoice(w) {
+		return p.executeQDC507VoiceAT(deviceID, "ATH", 3*time.Second)
+	}
 	_, err := w.QMICore.VOICEEndCall(ctx, callID)
 	return err
+}
+
+// QDC507/Baiwang removes the modem's original audio route. Its proven call
+// path uses USB AT for call control while QMI remains the IMS/status channel.
+func (p *Pool) useQDC507ATVoice(w *Worker) bool {
+	return w != nil && isBaiwangUSB(strings.TrimSpace(w.Config.USBPath))
+}
+
+// UseATVoiceStatus reports whether AT+CLCC must be treated as the authoritative
+// call-state source. QDC507 firmware can deliver RING/CLCC on the AT port while
+// omitting the corresponding QMI VOICE indication.
+func (p *Pool) UseATVoiceStatus(deviceID string) bool {
+	return p != nil && p.useQDC507ATVoice(p.GetWorker(strings.TrimSpace(deviceID)))
+}
+
+// executeQDC507VoiceAT uses Pool.ExecuteAT so QDC507 call control works in
+// both mixed AT mode and pure QMI mode. Pure QMI intentionally has no resident
+// AT manager; ExecuteAT then opens the configured port for one serialized
+// command instead of failing with "AT manager not started".
+func (p *Pool) executeQDC507VoiceAT(deviceID, command string, timeout time.Duration) error {
+	w := p.GetWorker(deviceID)
+	if w != nil && w.Modem != nil && w.Modem.CanExecuteAT() {
+		// Manager consumes the terminal OK and returns an empty payload for
+		// successful ATA/ATH. Its error result is the success authority.
+		_, err := w.Modem.ExecuteAT(command, timeout)
+		return err
+	}
+	response, err := p.ExecuteAT(deviceID, command, timeout)
+	if err != nil {
+		return fmt.Errorf("QDC507 语音 AT %s 失败: %w", command, err)
+	}
+	return validateQDC507VoiceATResponse(command, response)
+}
+
+func validateQDC507VoiceATResponse(command, response string) error {
+	upper := strings.ToUpper(response)
+	if strings.Contains(upper, "ERROR") || strings.Contains(upper, "NO CARRIER") {
+		return fmt.Errorf("QDC507 语音 AT %s 被模组拒绝: %s", command, strings.TrimSpace(response))
+	}
+	if !strings.Contains(upper, "OK") && !strings.Contains(upper, "CONNECT") {
+		return fmt.Errorf("QDC507 语音 AT %s 返回异常: %s", command, strings.TrimSpace(response))
+	}
+	return nil
+}
+
+func (p *Pool) findATVoiceCallID(ctx context.Context, w *Worker, number string) (uint8, error) {
+	if w == nil || w.Modem == nil || !w.Modem.CanExecuteAT() {
+		return 0, fmt.Errorf("QDC507 AT 呼叫没有 AT 状态通道")
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	deadline := time.NewTimer(3 * time.Second)
+	defer deadline.Stop()
+	ticker := time.NewTicker(150 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		if response, err := w.Modem.ExecuteAT("AT+CLCC", time.Second); err == nil {
+			if id, ok := outboundCLCCID(response, number); ok {
+				return id, nil
+			}
+		}
+		select {
+		case <-ctx.Done():
+			return 0, fmt.Errorf("等待 QDC507 AT 呼叫 call ID 被取消: %w", ctx.Err())
+		case <-deadline.C:
+			return 0, fmt.Errorf("QDC507 AT 呼叫已发出，但 3 秒内未获得匹配的 CLCC voice call ID")
+		case <-ticker.C:
+		}
+	}
+}
+
+func outboundCLCCID(response, number string) (uint8, bool) {
+	var candidates []uint8
+	for _, line := range strings.Split(strings.ReplaceAll(response, "\r", ""), "\n") {
+		line = strings.TrimSpace(line)
+		if !strings.HasPrefix(line, "+CLCC:") {
+			continue
+		}
+		r := csv.NewReader(strings.NewReader(strings.TrimSpace(strings.TrimPrefix(line, "+CLCC:"))))
+		r.TrimLeadingSpace = true
+		f, err := r.Read()
+		if err != nil || len(f) < 5 || f[1] != "0" || f[3] != "0" || (f[2] != "0" && f[2] != "2" && f[2] != "3") {
+			continue
+		}
+		id, err := strconv.ParseUint(f[0], 10, 8)
+		if err != nil || id == 0 {
+			continue
+		}
+		if len(f) > 5 && f[5] != "" {
+			if sameVoiceNumber(f[5], number) {
+				return uint8(id), true
+			}
+			continue
+		}
+		candidates = append(candidates, uint8(id))
+	}
+	if len(candidates) == 1 {
+		return candidates[0], true
+	}
+	return 0, false
+}
+
+func sameVoiceNumber(a, b string) bool {
+	clean := func(s string) string {
+		var out strings.Builder
+		for _, r := range s {
+			if r >= '0' && r <= '9' {
+				out.WriteRune(r)
+			}
+		}
+		return out.String()
+	}
+	a, b = clean(a), clean(b)
+	if a == b {
+		return true
+	}
+	if len(a) > 11 {
+		a = a[len(a)-11:]
+	}
+	if len(b) > 11 {
+		b = b[len(b)-11:]
+	}
+	return a == b
 }
 
 func (p *Pool) VOICEManageCalls(ctx context.Context, deviceID string, req qmi.VoiceManageCallsRequest) error {

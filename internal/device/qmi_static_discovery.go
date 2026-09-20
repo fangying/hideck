@@ -696,6 +696,9 @@ func modemUACUnusable(usbPath string) bool {
 	if strings.TrimSpace(usbPath) == "" {
 		return false
 	}
+	if qdc507ResidentAudioReady(usbPath) {
+		return false
+	}
 	for _, name := range []string{"product", "manufacturer"} {
 		if unusableUACName(readSysfsText(filepath.Join(usbPath, name))) {
 			return true

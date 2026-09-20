@@ -285,6 +285,35 @@ func (c *Controller) ensureVoicePCM(deviceID string) {
 		return
 	}
 	deviceID = strings.TrimSpace(deviceID)
+	if c.managedRoute(deviceID) {
+		// Managed QDC507 voice never uses QPCMV, including idle initialization.
+		// Actual readiness is checked by the lease before opening ALSA.
+		c.mu.Lock()
+		s := c.ensureLocked(deviceID)
+		if s.status.QPCMVFailed {
+			s.alsaUnavailable = false
+		}
+		s.qpcmvTried, s.qpcmvOK = true, true
+		s.status.QPCMVFailed = false
+		c.mu.Unlock()
+		return
+	}
+	// QDC507 routes voice through the externally supervised ADB/D4 runtime,
+	// not QPCMV. Recheck readiness before the cached AT result so a runtime
+	// that recovered after initialization can make audio usable again.
+	if resident, ok := c.host.(interface{ USBResidentAudioReady(string) bool }); ok &&
+		resident.USBResidentAudioReady(deviceID) && !c.usbAudioUnusable(deviceID) &&
+		strings.TrimSpace(c.host.AudioDevice(deviceID)) != "" {
+		c.mu.Lock()
+		s := c.ensureLocked(deviceID)
+		if s.status.QPCMVFailed {
+			s.alsaUnavailable = false
+		}
+		s.qpcmvTried, s.qpcmvOK = true, true
+		s.status.QPCMVFailed = false
+		c.mu.Unlock()
+		return
+	}
 	c.mu.Lock()
 	s := c.ensureLocked(deviceID)
 	if s.qpcmvTried {
@@ -475,11 +504,27 @@ func (c *Controller) patch(deviceID string, fn func(*Status)) {
 }
 
 func (c *Controller) readPLMN(deviceID string) (string, string, error) {
-	resp, err := execAT(c.host, deviceID, COPSQueryCommand())
-	if err != nil {
-		return "", "", err
+	var lastErr error
+	for attempt := 0; attempt < 4; attempt++ {
+		resp, err := execAT(c.host, deviceID, COPSQueryCommand())
+		if err == nil {
+			mcc, mnc, parseErr := ParseCOPS(resp)
+			if parseErr == nil {
+				return mcc, mnc, nil
+			}
+			lastErr = parseErr
+		} else {
+			lastErr = err
+		}
+		// QDC507 can emit a short burst of unsolicited CLCC records while
+		// bringing up its internal IMS calls. A concurrent COPS query may then
+		// receive only that burst. Retry after it drains instead of failing the
+		// entire boot-time VoLTE recovery.
+		if attempt < 3 {
+			time.Sleep(200 * time.Millisecond)
+		}
 	}
-	return ParseCOPS(resp)
+	return "", "", lastErr
 }
 
 func (c *Controller) waitLTE(ctx context.Context, deviceID string) error {

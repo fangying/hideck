@@ -183,6 +183,99 @@ func TestVoiceAgentMTNoDuplicateIncoming(t *testing.T) {
 	}
 }
 
+func TestIncomingAnswerPromotesStateWhenQMIStaysRinging(t *testing.T) {
+	ctl, host := enableVoice(t)
+	var incoming []voicehost.IncomingCall
+	var events []voicehost.CallEvent
+	ctl.SubscribeIncomingCalls(func(call voicehost.IncomingCall) { incoming = append(incoming, call) })
+	ctl.SubscribeCallEvents(func(ev voicehost.CallEvent) { events = append(events, ev) })
+	info := &qmi.VoiceAllCallInfo{
+		Calls:              []qmi.VoiceCallInfo{{ID: 2, State: qmiCallIncoming, Direction: qmiDirMT}},
+		RemotePartyNumbers: []qmi.VoiceRemotePartyNumber{{CallID: 2, Number: "13800138000"}},
+	}
+	host.fireVoice(info)
+	if len(incoming) != 1 {
+		t.Fatalf("incoming %d", len(incoming))
+	}
+	media := ctl.media.get(incoming[0].CallID)
+	if media == nil || media.deferred == nil {
+		t.Fatal("incoming media must defer modem PCM until ATA succeeds")
+	}
+	media.deferred.mu.RLock()
+	openedWhileRinging := media.deferred.current != nil
+	media.deferred.mu.RUnlock()
+	if openedWhileRinging {
+		t.Fatal("modem PCM opened while call was still ringing")
+	}
+
+	if _, err := ctl.AnswerIncomingCall(context.Background(), voicehost.AnswerRequest{
+		DeviceID: "wwan1", CallID: incoming[0].CallID,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	call, ok := ctl.lookup("wwan1", incoming[0].CallID)
+	if !ok || call.State != "connected" {
+		t.Fatalf("call=%+v exists=%v", call, ok)
+	}
+	media.deferred.mu.RLock()
+	openedAfterAnswer := media.deferred.current != nil
+	media.deferred.mu.RUnlock()
+	if !openedAfterAnswer {
+		t.Fatal("modem PCM was not activated after ATA succeeded")
+	}
+
+	// QDC507 can keep reporting INCOMING after ATA. It must not regress the
+	// locally authoritative connected state or emit another ringing event.
+	host.fireVoice(info)
+	call, ok = ctl.lookup("wwan1", incoming[0].CallID)
+	if !ok || call.State != "connected" {
+		t.Fatalf("stale QMI regressed call=%+v exists=%v", call, ok)
+	}
+	host.fireVoice(&qmi.VoiceAllCallInfo{
+		Calls: []qmi.VoiceCallInfo{{ID: 2, State: qmiCallEnd, Direction: qmiDirMT}},
+	})
+	if countType(events, "CallAnswered") != 1 || countType(events, "CallEnded") != 1 || countType(events, "CallCanceled") != 0 {
+		t.Fatalf("events %v", eventTypes(events))
+	}
+}
+
+func TestCLCCActiveDetection(t *testing.T) {
+	tests := []struct {
+		name     string
+		response string
+		want     bool
+	}{
+		{name: "incoming", response: "+CLCC: 1,1,4,0,0,\"13800138000\",145\r\nOK\r\n"},
+		{name: "active", response: "+CLCC: 1,1,0,0,0,\"13800138000\",145\r\nOK\r\n", want: true},
+		{name: "active data session", response: "+CLCC: 2,1,0,1,0,\"\",128\r\nOK\r\n"},
+		{name: "multiple", response: "+CLCC: 1,1,5,0,0,\"10086\",129\r\n+CLCC: 2,1,0,0,0,\"13800138000\",145\r\nOK\r\n", want: true},
+		{name: "empty", response: "OK\r\n"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := clccHasActiveCall(tt.response); got != tt.want {
+				t.Fatalf("clccHasActiveCall()=%v want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestParseCLCCVoiceInfoFiltersDataAndMapsIncoming(t *testing.T) {
+	info := parseCLCCVoiceInfo("AT+CLCC\r\r\n" +
+		"+CLCC: 2,1,0,1,0,\"\",128\r\n" +
+		"+CLCC: 4,1,4,0,0,\"19157652977\",128\r\nOK\r\n")
+	if len(info.Calls) != 1 {
+		t.Fatalf("calls=%d want 1", len(info.Calls))
+	}
+	call := info.Calls[0]
+	if call.ID != 4 || call.Direction != qmiDirMT || call.State != qmiCallIncoming || call.Mode != qmi.VoiceCallModeLTE {
+		t.Fatalf("call=%+v", call)
+	}
+	if len(info.RemotePartyNumbers) != 1 || info.RemotePartyNumbers[0].Number != "19157652977" {
+		t.Fatalf("remote=%+v", info.RemotePartyNumbers)
+	}
+}
+
 func TestVoiceAgentReusesQMICallIDAfterEnd(t *testing.T) {
 	ctl, host := enableVoice(t)
 	var events []voicehost.CallEvent
@@ -458,7 +551,7 @@ func TestIncomingEndReasonCancelsRinging(t *testing.T) {
 		RemotePartyNumbers: []qmi.VoiceRemotePartyNumber{{CallID: 1, Number: "18500002222"}},
 	})
 	host.fireVoice(&qmi.VoiceAllCallInfo{
-		Calls: []qmi.VoiceCallInfo{{ID: 1, State: qmiCallIncoming, Direction: qmiDirMT}},
+		Calls:              []qmi.VoiceCallInfo{{ID: 1, State: qmiCallIncoming, Direction: qmiDirMT}},
 		RemotePartyNumbers: []qmi.VoiceRemotePartyNumber{{CallID: 1, Number: "18500002222"}},
 		EndReasons:         []qmi.VoiceCallEndReason{{CallID: 1, Reason: 16}},
 	})

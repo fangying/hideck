@@ -13,6 +13,82 @@ type callMedia struct {
 	conn   net.PacketConn
 	sdp    string
 	pcm    PCMPort
+
+	// deferred is used for mobile-terminated calls. The WebRTC endpoint is
+	// created while the phone is ringing, but the modem PCM device must not be
+	// opened until ATA has completed.
+	deferred *switchablePCM
+}
+
+// switchablePCM starts as a silent source/sink and atomically switches to the
+// modem PCM port after an incoming call is answered. Holding the read lock for
+// a frame operation prevents Replace or Close from racing with bridge I/O.
+type switchablePCM struct {
+	mu      sync.RWMutex
+	current PCMPort
+	closed  bool
+}
+
+func (p *switchablePCM) ReadFrame() ([]int16, error) {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	if p.current == nil {
+		return make([]int16, pcmuFrameSamples), nil
+	}
+	return p.current.ReadFrame()
+}
+
+func (p *switchablePCM) WriteFrame(samples []int16) error {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	if p.current == nil {
+		return nil
+	}
+	return p.current.WriteFrame(samples)
+}
+
+func (p *switchablePCM) Replace(next PCMPort) error {
+	p.mu.Lock()
+	if p.closed {
+		p.mu.Unlock()
+		if next != nil {
+			return next.Close()
+		}
+		return nil
+	}
+	previous := p.current
+	p.current = next
+	p.mu.Unlock()
+	if previous != nil {
+		return previous.Close()
+	}
+	return nil
+}
+
+func (p *switchablePCM) Close() error {
+	p.mu.Lock()
+	if p.closed {
+		p.mu.Unlock()
+		return nil
+	}
+	p.closed = true
+	current := p.current
+	p.current = nil
+	p.mu.Unlock()
+	if current != nil {
+		return current.Close()
+	}
+	return nil
+}
+
+func (m *callMedia) activatePCM(pcm PCMPort) error {
+	if m == nil || m.deferred == nil {
+		if pcm != nil {
+			return pcm.Close()
+		}
+		return nil
+	}
+	return m.deferred.Replace(pcm)
 }
 
 func pcmuOfferSDP(port int) string {
@@ -66,6 +142,17 @@ func startCallMedia(browserSDP string, pcm PCMPort, listenOnly bool) (*callMedia
 	}
 	bridge := NewPCMBridge(conn, remote, pcm, listenOnly)
 	return &callMedia{bridge: bridge, conn: conn, sdp: pcmuOfferSDP(port), pcm: pcm}, nil
+}
+
+func startDeferredCallMedia(browserSDP string, listenOnly bool) (*callMedia, error) {
+	pcm := &switchablePCM{}
+	media, err := startCallMedia(browserSDP, pcm, listenOnly)
+	if err != nil {
+		_ = pcm.Close()
+		return nil, err
+	}
+	media.deferred = pcm
+	return media, nil
 }
 
 func (m *callMedia) Close() error {
