@@ -1,0 +1,2 @@
+# HiDeck owns this modem; ModemManager must not probe its AT/QMI ports.
+ATTRS{idVendor}=="2ca3", ATTRS{idProduct}=="4006", ENV{ID_MM_DEVICE_IGNORE}="1", ENV{ID_MM_PORT_IGNORE}="1"

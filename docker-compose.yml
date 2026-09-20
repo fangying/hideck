@@ -13,6 +13,8 @@ services:
       - ./data:/app/data
       - ./logs:/app/logs
       - /dev:/dev
+      # QDC507 host audio broker socket and per-call readiness state.
+      - /run/hideck-qdc507-audio:/run/hideck-qdc507-audio:ro
     environment:
       TZ: Asia/Shanghai
       CONFIG_PATH: /app/config/config.yaml

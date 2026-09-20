@@ -1,0 +1,16 @@
+[Unit]
+Description=HiDeck QDC507 D4-to-UAC audio route runtime
+After=docker.service hideck-qdc507-boot-reset.service
+Requires=hideck-qdc507-boot-reset.service
+Wants=docker.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/sbin/hideck-qdc507-audio-runtime
+Restart=no
+SuccessExitStatus=143
+RestartSec=5
+TimeoutStopSec=15
+
+[Install]
+WantedBy=multi-user.target

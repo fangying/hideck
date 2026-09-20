@@ -1,0 +1,14 @@
+[Unit]
+Description=Restart DJI QDC507 firmware once per host boot
+After=hideck-qdc507-usb.service
+Requires=hideck-qdc507-usb.service
+Before=hideck-qdc507-audio.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/hideck-qdc507-boot-reset
+RemainAfterExit=yes
+TimeoutStartSec=300
+
+[Install]
+WantedBy=multi-user.target

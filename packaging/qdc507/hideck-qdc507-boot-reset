@@ -1,0 +1,40 @@
+#!/usr/bin/env bash
+# Some host warm reboots leave the USB-powered modem's QMI firmware wedged.
+# Run once before audio initialization, never as a periodic health action.
+set -euo pipefail
+exec 9>/run/hideck-qdc507-boot-reset.lock
+flock -x 9
+marker=/run/hideck-qdc507-boot-reset.done
+[[ ! -e "$marker" ]] || exit 0
+if ! timeout 30 adb -d wait-for-device; then
+  adb kill-server
+  adb start-server
+  timeout 60 adb -d wait-for-device
+fi
+path=$(timeout 10 adb -d get-devpath)
+[[ "$path" == usb:* ]] || exit 1
+device=/sys/bus/usb/devices/${path#usb:}
+[[ "$(cat "$device/idVendor"):$(cat "$device/idProduct")" == 2ca3:4006 ]] || exit 1
+old_boot=$(timeout 10 adb -d shell cat /proc/sys/kernel/random/boot_id | tr -d '\r')
+[[ -n "$old_boot" ]] || exit 1
+echo "Restarting verified DJI modem at $path before HiDeck startup"
+timeout 10 adb -d reboot
+sleep 5
+adb kill-server
+adb start-server
+if ! timeout 20 adb -d wait-for-device; then
+  adb kill-server
+  adb start-server
+  timeout 90 adb -d wait-for-device
+fi
+for ((attempt=0; attempt<30; attempt++)); do
+  new_boot=$(timeout 5 adb -d shell cat /proc/sys/kernel/random/boot_id 2>/dev/null | tr -d '\r') || new_boot=
+  if [[ -n "$new_boot" && "$new_boot" != "$old_boot" ]]; then
+    touch "$marker"
+    echo "DJI modem software restart verified: $new_boot"
+    exit 0
+  fi
+  sleep 2
+done
+echo 'DJI modem restart was not verified; refusing to initialize audio' >&2
+exit 1

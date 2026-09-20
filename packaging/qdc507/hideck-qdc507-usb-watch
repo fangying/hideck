@@ -1,0 +1,24 @@
+#!/usr/bin/env bash
+# Reconcile only DJI 2ca3:4006, including interface-only reauthorization.
+set -uo pipefail
+while :; do
+  for device in /sys/bus/usb/devices/*; do
+    [[ -f "$device/idVendor" && -f "$device/idProduct" ]] || continue
+    [[ "$(cat "$device/idVendor"):$(cat "$device/idProduct")" == 2ca3:4006 ]] || continue
+    name=${device##*/}
+    repair=0
+    for n in 0 1 2 3 4 5 6 7 8; do
+      interface="$device/$name:1.$n"
+      [[ -d "$interface" ]] || continue
+      driver=$(basename "$(readlink "$interface/driver" 2>/dev/null)" 2>/dev/null)
+      case "$n:$driver" in
+        [0-3]:option|4:qmi_wwan|5:usbfs|5:|[6-8]:snd-usb-audio) ;;
+        *) repair=1 ;;
+      esac
+    done
+    if [[ "$repair" == 1 ]]; then
+      /usr/local/sbin/qdc507-usb-bind.sh "$name"
+    fi
+  done
+  sleep 2
+done

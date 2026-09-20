@@ -1,0 +1,12 @@
+[Unit]
+Description=Reconcile DJI QDC507 USB interface drivers
+After=systemd-udevd.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/sbin/hideck-qdc507-usb-watch
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

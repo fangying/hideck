@@ -1,0 +1,140 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+runtime_dir=${QDC507_RUNTIME_DIR:-/opt/qdc507-voice-runtime}
+remote_dir=/tmp/modemdeck-qdc507-voice
+state_dir=/run/hideck-qdc507-audio
+adb_bin=/usr/bin/adb
+cal_pid=
+route_pid=
+
+adb_run() {
+  local output marker
+  output=$("$adb_bin" shell "$1; rc=\$?; echo; echo __HIDECK_REMOTE_RC__:\$rc") || return 1
+  output=${output//$'\r'/}
+  marker=${output##*$'\n'}
+  if [[ "$marker" != "__HIDECK_REMOTE_RC__:0" ]]; then
+    printf '%s\n' "$output" >&2
+    return 1
+  fi
+}
+
+stop_remote_audio() {
+  "$adb_bin" shell \
+    "killall mavo-pcm-bridge.armv7 2>/dev/null || true; killall alsaucm_test 2>/dev/null || true; rm -f /run/alsaucm_test" \
+    >/dev/null 2>&1 || true
+}
+
+cleanup() {
+  local rc=$?
+  trap - EXIT INT TERM
+  rm -f "$state_dir/ready" "$state_dir/ready.tmp"
+  [[ -z "$route_pid" ]] || kill "$route_pid" 2>/dev/null || true
+  [[ -z "$cal_pid" ]] || kill "$cal_pid" 2>/dev/null || true
+  stop_remote_audio
+  exit "$rc"
+}
+trap cleanup EXIT INT TERM
+
+mkdir -p "$state_dir"
+chmod 755 "$state_dir"
+rm -f "$state_dir/ready" "$state_dir/ready.tmp" \
+  "$state_dir/calibration.log" "$state_dir/route.log"
+
+cd "$runtime_dir"
+sha256sum -c --status <<'EOF'
+f4f6c266ced7015d4e61d993a6e31247c26a9e85a8fdf1c6d842c459e1e2970a  manifest.json
+3d82d3dec4f1e323201bba87156df9d41438e08314097353f2607f9117211d4a  qdc507_aprv3.ko
+ed3821682d5309969a01c764192c83feff9669c61ef237c69475cd1619cf296c  qdc507_voice.ko
+88d47c15e61d1428a59c821fed804c2e6490e82859a085062f21966b58d167fc  mavo-pcm-bridge.armv7
+EOF
+
+# This host runtime owns its ADB server. After option releases the ADB
+# interface, an already-running server can retain a missing/offline transport.
+if ! timeout 20 "$adb_bin" wait-for-device; then
+  "$adb_bin" kill-server || true
+  "$adb_bin" start-server
+  timeout 20 "$adb_bin" wait-for-device
+fi
+[[ "$("$adb_bin" shell id -u | tr -d '\r')" == 0 ]]
+[[ "$("$adb_bin" shell uname -r | tr -d '\r')" == 3.18.44 ]]
+
+# A killed adb client does not necessarily terminate its remote child. Always
+# start from one known route and one calibration process after hotplug/restart.
+stop_remote_audio
+
+"$adb_bin" shell "mkdir -p '$remote_dir' && chmod 700 '$remote_dir'"
+for file in manifest.json qdc507_aprv3.ko qdc507_voice.ko mavo-pcm-bridge.armv7; do
+  "$adb_bin" push "$runtime_dir/$file" "$remote_dir/$file" >/dev/null
+done
+"$adb_bin" shell "chmod 755 '$remote_dir/mavo-pcm-bridge.armv7'"
+
+if ! adb_run "grep -q '^qdc507_aprv3 ' /proc/modules"; then
+  adb_run "insmod '$remote_dir/qdc507_aprv3.ko'"
+fi
+if ! adb_run "grep -q '^qdc507_voice ' /proc/modules"; then
+  adb_run "insmod '$remote_dir/qdc507_voice.ko'"
+fi
+
+for _ in {1..100}; do
+  if adb_run "test -c /dev/msm_audio_cal && test -c /dev/snd/controlC0 && test -c /dev/snd/pcmC0D4p && test -c /dev/snd/pcmC0D4c && test -c /dev/snd/pcmC0D5p && test -c /dev/snd/pcmC0D6c"; then
+    break
+  fi
+  sleep 0.2
+done
+adb_run "test -c /dev/msm_audio_cal && test -c /dev/snd/controlC0 && test -c /dev/snd/pcmC0D4p && test -c /dev/snd/pcmC0D4c && test -c /dev/snd/pcmC0D5p && test -c /dev/snd/pcmC0D6c"
+sleep 2
+
+"$adb_bin" shell /usr/bin/alsaucm_test >"$state_dir/calibration.log" 2>&1 &
+cal_pid=$!
+for _ in {1..50}; do
+  adb_run "test -p /run/alsaucm_test" && break
+  kill -0 "$cal_pid"
+  sleep 0.1
+done
+adb_run "test -p /run/alsaucm_test"
+for _ in {1..100}; do
+  grep -q 'ACDB -> init done!' "$state_dir/calibration.log" && break
+  kill -0 "$cal_pid"
+  sleep 0.1
+done
+grep -q 'ACDB -> init done!' "$state_dir/calibration.log"
+for command in \
+  'open snd_soc_msm_9x07_Tomtom_I2S' \
+  'set _verb VoLTE' \
+  'set _enadev Auxpcm Rx' \
+  'set _enadev Auxpcm Tx' \
+  'set _enamod Play VoLTE'; do
+  adb_run "printf '%s\\n' '$command' > /run/alsaucm_test"
+  sleep 0.5
+done
+for _ in {1..100}; do
+  grep -q 'ACDB -> Sent VocProc Cal!' "$state_dir/calibration.log" && break
+  kill -0 "$cal_pid"
+  sleep 0.1
+done
+grep -q 'ACDB -> Sent VocProc Cal!' "$state_dir/calibration.log"
+adb_run "'$remote_dir/mavo-pcm-bridge.armv7' --check"
+
+"$adb_bin" shell "'$remote_dir/mavo-pcm-bridge.armv7' --voice-route-session --verbose" \
+  >"$state_dir/route.log" 2>&1 &
+route_pid=$!
+for _ in {1..100}; do
+  grep -q 'VoLTE route session active on hw:0,4' "$state_dir/route.log" && break
+  kill -0 "$route_pid"
+  sleep 0.1
+done
+grep -q 'VoLTE route session active on hw:0,4' "$state_dir/route.log"
+
+# UAC PCM becomes RUNNING only while the host opens the stream. Requiring that
+# state here makes an otherwise healthy boot-time service fail while idle.
+adb_run "test \"\$(cat /sys/class/android_usb/f_audio/audio_enable)\" = 1"
+printf 'ready\n' >"$state_dir/ready.tmp"
+mv "$state_dir/ready.tmp" "$state_dir/ready"
+
+# Keep adb shell and the module-side bridge supervised by systemd. Any bridge
+# exit is a service failure and must trigger a clean restart.
+wait "$route_pid"
+route_rc=$?
+route_pid=
+exit "$route_rc"
