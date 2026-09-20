@@ -26,6 +26,29 @@ test('parses SSE data while ignoring heartbeat and metadata fields', () => {
   assert.deepEqual(events.map((event) => event.id), [3])
 })
 
+test('stalled event stream times out and cancels its reader', async () => {
+  let canceled = false
+  const stream = new ReadableStream<Uint8Array>({ cancel() { canceled = true } })
+  await assert.rejects(readPhoneEvents(stream, () => {}, 10), /心跳超时/)
+  assert.equal(canceled, true)
+  assert.equal(stream.locked, false)
+})
+
+test('CRLF split between chunks still delivers each event promptly', async () => {
+  const encoder = new TextEncoder()
+  const stream = new ReadableStream<Uint8Array>({
+    start(controller) {
+      controller.enqueue(encoder.encode(`data: ${JSON.stringify(phoneEvent(1))}\r`))
+      controller.enqueue(encoder.encode('\n\r'))
+      controller.enqueue(encoder.encode('\n'))
+      controller.close()
+    }
+  })
+  const events: PhoneEvent[] = []
+  await readPhoneEvents(stream, event => events.push(event))
+  assert.deepEqual(events.map(event => event.id), [1])
+})
+
 test('reads fragmented CRLF SSE blocks and flushes the final event', async () => {
   const encoder = new TextEncoder()
   const payload = [

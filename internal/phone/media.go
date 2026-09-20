@@ -91,8 +91,30 @@ func newWebRTCAPI(mux ice.UDPMux, publicHost string) (*webrtc.API, error) {
 	}
 	settings := webrtc.SettingEngine{}
 	settings.SetICEUDPMux(mux)
+	// When a public host is configured, the service is intentionally exposed
+	// through that LAN/public IPv4 address. Restrict candidates in that mode;
+	// keep the default network set for tests and deployments without a public
+	// host, where loopback/IPv6 candidates may still be valid.
+	settings.SetInterfaceFilter(func(name string) bool {
+		return name != "docker0"
+	})
 	if err := setWebRTCPublicHost(&settings, publicHost, net.DefaultResolver.LookupIPAddr); err != nil {
 		return nil, err
+	}
+	if strings.TrimSpace(publicHost) != "" {
+		settings.SetNetworkTypes([]webrtc.NetworkType{webrtc.NetworkTypeUDP4})
+		allowedIPs, err := resolveWebRTCPublicIPs(publicHost, net.DefaultResolver.LookupIPAddr)
+		if err != nil {
+			return nil, err
+		}
+		settings.SetIPFilter(func(ip net.IP) bool {
+			for _, allowed := range allowedIPs {
+				if ip.Equal(net.ParseIP(allowed)) {
+					return true
+				}
+			}
+			return false
+		})
 	}
 	return webrtc.NewAPI(webrtc.WithMediaEngine(mediaEngine), webrtc.WithSettingEngine(settings)), nil
 }
@@ -111,7 +133,10 @@ func setWebRTCPublicHost(settings *webrtc.SettingEngine, value string, lookup pu
 	if err := settings.SetICEAddressRewriteRules(webrtc.ICEAddressRewriteRule{
 		External:        publicIPs,
 		AsCandidateType: webrtc.ICECandidateTypeHost,
-		Mode:            webrtc.ICEAddressRewriteAppend,
+		// Replace host candidates instead of appending the host's complete
+		// interface list. In host-network mode the latter includes Docker and
+		// IPv6 addresses that are not reachable by the LAN browser.
+		Mode: webrtc.ICEAddressRewriteReplace,
 	}); err != nil {
 		return fmt.Errorf("phone: configure WebRTC public host: %w", err)
 	}

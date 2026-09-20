@@ -5,10 +5,12 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"strings"
 	"sync"
 	"sync/atomic"
 
 	"github.com/pion/webrtc/v4"
+	"github.com/yibaiba/hideck/pkg/logger"
 )
 
 type mediaSessionOptions struct {
@@ -44,6 +46,7 @@ type MediaSession struct {
 }
 
 func newMediaSession(ctx context.Context, options mediaSessionOptions) (*MediaSession, string, error) {
+	logger.Info("电话 WebRTC Offer 已收到", "media_id", options.ID, "candidates", sdpCandidates(options.Offer))
 	receiveOnly, err := browserOfferReceivesOnlyAudio(options.Offer)
 	if err != nil {
 		return nil, "", err
@@ -69,8 +72,37 @@ func newMediaSession(ctx context.Context, options mediaSessionOptions) (*MediaSe
 		_ = session.Close()
 		return nil, "", err
 	}
+	answer = filterIPv4Candidates(answer)
+	logger.Info("电话 WebRTC SDP 已生成", "media_id", options.ID, "candidates", sdpCandidates(answer))
 	go session.forwardIMSRTP()
 	return session, answer, nil
+}
+
+// filterIPv4Candidates prevents browsers from selecting an IPv6 host candidate
+// when the phone service is intentionally exposed through the LAN IPv4 address.
+func filterIPv4Candidates(sdp string) string {
+	lines := strings.Split(strings.ReplaceAll(sdp, "\r\n", "\n"), "\n")
+	filtered := lines[:0]
+	for _, line := range lines {
+		if strings.HasPrefix(line, "a=candidate:") {
+			fields := strings.Fields(line)
+			if len(fields) >= 5 && net.ParseIP(fields[4]) != nil && net.ParseIP(fields[4]).To4() == nil {
+				continue
+			}
+		}
+		filtered = append(filtered, line)
+	}
+	return strings.Join(filtered, "\r\n")
+}
+
+func sdpCandidates(sdp string) []string {
+	var candidates []string
+	for _, line := range strings.Split(strings.ReplaceAll(sdp, "\r\n", "\n"), "\n") {
+		if strings.HasPrefix(line, "a=candidate:") {
+			candidates = append(candidates, line)
+		}
+	}
+	return candidates
 }
 
 func (s *MediaSession) negotiate(ctx context.Context, offer string) (string, error) {
@@ -88,9 +120,13 @@ func (s *MediaSession) negotiate(ctx context.Context, offer string) (string, err
 	go drainRTCP(sender, s.closed)
 	s.peer.OnTrack(func(remote *webrtc.TrackRemote, _ *webrtc.RTPReceiver) { go s.forwardBrowserRTP(remote) })
 	s.peer.OnConnectionStateChange(func(state webrtc.PeerConnectionState) {
+		logger.Info("电话 WebRTC PeerConnection 状态", "media_id", s.ID, "state", state.String())
 		if s.onState != nil {
 			s.onState(s.ID, state)
 		}
+	})
+	s.peer.OnICEConnectionStateChange(func(state webrtc.ICEConnectionState) {
+		logger.Info("电话 WebRTC ICE 状态", "media_id", s.ID, "state", state.String())
 	})
 	if err := s.peer.SetRemoteDescription(webrtc.SessionDescription{Type: webrtc.SDPTypeOffer, SDP: offer}); err != nil {
 		return "", fmt.Errorf("phone: apply WebRTC offer: %w", err)

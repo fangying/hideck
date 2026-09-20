@@ -34,6 +34,7 @@ type PhoneState = {
 let clockTimer: number | null = null
 let mediaController: PhoneMediaController | null = null
 let eventListener: PhoneEventListener | null = null
+let resumeEventStream: (() => void) | null = null
 
 export const usePhoneStore = defineStore('phone', {
   state: (): PhoneState => ({
@@ -94,9 +95,30 @@ export const usePhoneStore = defineStore('phone', {
       }
       this.startEventStream()
       this.startClock()
+      let lastResume = 0
+      resumeEventStream = () => {
+        if (document.visibilityState === 'hidden' || Date.now() - lastResume < 250) return
+        lastResume = Date.now()
+        // A stream can appear open after macOS sleep/lock while no longer
+        // delivering events. Reconnect and reconcile through onOpen without
+        // touching the existing WebRTC microphone or media session.
+        eventListener?.stop()
+        eventListener = null
+        this.listening = false
+        this.startEventStream()
+      }
+      window.addEventListener('focus', resumeEventStream)
+      window.addEventListener('online', resumeEventStream)
+      document.addEventListener('visibilitychange', resumeEventStream)
     },
 
     dispose() {
+      if (resumeEventStream) {
+        window.removeEventListener('focus', resumeEventStream)
+        window.removeEventListener('online', resumeEventStream)
+        document.removeEventListener('visibilitychange', resumeEventStream)
+        resumeEventStream = null
+      }
       this.listening = false
       eventListener?.stop()
       eventListener = null
