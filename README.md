@@ -59,7 +59,7 @@ curl -fsSL https://raw.githubusercontent.com/yibaiba/hideck/main/deploy.sh | \
   HIDECK_DIR=/opt/hideck sh
 ```
 
-Image: `yibaiba/hideck:latest`. Compose uses `network_mode: host`, `privileged: true`, `/dev`, and persists `config/`, `data/`, `logs/`. See [DOCKERHUB.md](DOCKERHUB.md) and [HTTPS / WebRTC](docs/https-webrtc.md).
+Image: `yibaiba/hideck:latest`. Compose uses `network_mode: host`, `privileged: true`, `/dev`, and persists `config/`, `data/`, `logs/`. See [DOCKERHUB.md](DOCKERHUB.md), [HTTPS / WebRTC](docs/https-webrtc.md), and the [QDC507/DJI 4G verified voice path](docs/hideck-dji4g.md).
 
 ```bash
 docker compose ps
