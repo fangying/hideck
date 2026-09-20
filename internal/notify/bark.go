@@ -104,9 +104,9 @@ func (b *BarkChannel) SendWithContextDetailed(ctx NotificationContext) (SendBark
 	var lastErr error
 	failedURLs := make([]string, 0)
 
-	for _, u := range b.urls {
+	for index, u := range b.urls {
 		wg.Add(1)
-		go func(targetURL string) {
+		go func(targetIndex int, targetURL string) {
 			defer wg.Done()
 
 			req, err := http.NewRequest(http.MethodPost, targetURL, bytes.NewReader(body))
@@ -122,10 +122,10 @@ func (b *BarkChannel) SendWithContextDetailed(ctx NotificationContext) (SendBark
 			resp, err := b.client.Do(req)
 			if err != nil {
 				mu.Lock()
-				lastErr = fmt.Errorf("请求发送失败: %w", err)
+				lastErr = fmt.Errorf("请求发送失败")
 				failedURLs = append(failedURLs, targetURL)
 				mu.Unlock()
-				logger.Warn("Bark 推送失败", "url", targetURL, "err", err)
+				logger.Warn("Bark 推送失败", "target_index", targetIndex, "error_type", fmt.Sprintf("%T", err))
 				return
 			}
 			defer resp.Body.Close()
@@ -136,9 +136,9 @@ func (b *BarkChannel) SendWithContextDetailed(ctx NotificationContext) (SendBark
 				lastErr = fmt.Errorf("HTTP 状态码错误: %d", resp.StatusCode)
 				failedURLs = append(failedURLs, targetURL)
 				mu.Unlock()
-				logger.Warn("Bark 推送返回错误状态码", "url", targetURL, "status", resp.StatusCode)
+				logger.Warn("Bark 推送返回错误状态码", "target_index", targetIndex, "status", resp.StatusCode)
 			}
-		}(u)
+		}(index, u)
 	}
 
 	wg.Wait()

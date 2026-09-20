@@ -175,9 +175,11 @@ func (s *Server) handleGetNotificationSettings(c *gin.Context) {
 	resp.Webhook.TextTemplate = s.fullCfg.Webhook.TextTemplate
 	resp.Webhook.Headers = s.fullCfg.Webhook.Headers
 	resp.Bark.Enabled = s.fullCfg.Bark.Enabled
-	resp.Bark.URLs = s.fullCfg.Bark.URLs
+	resp.Bark.URLs = maskedBarkURLs(s.fullCfg.Bark.URLs)
 	resp.Bark.Group = s.fullCfg.Bark.Group
-	resp.Bark.Icon = s.fullCfg.Bark.Icon
+	if s.fullCfg.Bark.Icon != "" {
+		resp.Bark.Icon = notificationSecretMask
+	}
 	resp.Bark.Level = s.fullCfg.Bark.Level
 
 	resp.Email.Enabled = s.fullCfg.Email.Enabled
@@ -289,20 +291,22 @@ func (s *Server) handleUpdateNotificationSettings(c *gin.Context) {
 		Headers:      req.Webhook.Headers,
 	}
 
-	barkURLs := make([]string, 0, len(req.Bark.URLs))
-	for _, u := range req.Bark.URLs {
-		u = strings.TrimSpace(u)
-		if u == "" {
-			continue
-		}
-		barkURLs = append(barkURLs, u)
+	barkURLs, err := resolveBarkURLs(req.Bark.URLs, s.fullCfg.Bark.URLs)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"status": "error", "message": err.Error()})
+		return
+	}
+	barkIcon, err := resolveMaskedNotificationSecret(req.Bark.Icon, s.fullCfg.Bark.Icon, "Bark Icon URL")
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"status": "error", "message": err.Error()})
+		return
 	}
 
 	barkCfg := config.BarkConfig{
 		Enabled: req.Bark.Enabled,
 		URLs:    barkURLs,
 		Group:   strings.TrimSpace(req.Bark.Group),
-		Icon:    strings.TrimSpace(req.Bark.Icon),
+		Icon:    barkIcon,
 		Level:   strings.TrimSpace(req.Bark.Level),
 	}
 

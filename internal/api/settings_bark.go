@@ -1,6 +1,7 @@
 package api
 
 import (
+	"errors"
 	"net/http"
 	"strings"
 	"time"
@@ -24,6 +25,33 @@ type testBarkResponse struct {
 	FailedURLs []string `json:"failed_urls,omitempty"`
 }
 
+func maskedBarkURLs(urls []string) []string {
+	masked := make([]string, len(urls))
+	for index := range masked {
+		masked[index] = notificationSecretMask
+	}
+	return masked
+}
+
+func resolveBarkURLs(incoming, current []string) ([]string, error) {
+	resolved := make([]string, 0, len(incoming))
+	for index, rawURL := range incoming {
+		value := strings.TrimSpace(rawURL)
+		if value == "" {
+			continue
+		}
+		if value != notificationSecretMask {
+			resolved = append(resolved, value)
+			continue
+		}
+		if index >= len(current) || strings.TrimSpace(current[index]) == "" {
+			return nil, errors.New("Bark URL 脱敏值没有可保留的原配置")
+		}
+		resolved = append(resolved, current[index])
+	}
+	return resolved, nil
+}
+
 func (s *Server) handleTestBarkNotification(c *gin.Context) {
 	var req testBarkRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
@@ -36,24 +64,29 @@ func (s *Server) handleTestBarkNotification(c *gin.Context) {
 		return
 	}
 
-	urls := make([]string, 0, len(req.URLs))
-	for _, u := range req.URLs {
-		trimmed := strings.TrimSpace(u)
-		if trimmed == "" {
-			continue
-		}
-		urls = append(urls, trimmed)
+	s.notificationConfigMu.Lock()
+	current := s.fullCfg.Bark
+	s.notificationConfigMu.Unlock()
+	urls, err := resolveBarkURLs(req.URLs, current.URLs)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"message": err.Error()})
+		return
 	}
 	if len(urls) == 0 {
 		c.JSON(http.StatusBadRequest, gin.H{"message": "至少需要一个有效的 Bark URL"})
 		return
 	}
 
+	icon, err := resolveMaskedNotificationSecret(req.Icon, current.Icon, "Bark Icon URL")
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"message": err.Error()})
+		return
+	}
 	ch, err := notify.NewBarkChannel(config.BarkConfig{
 		Enabled: true,
 		URLs:    urls,
 		Group:   strings.TrimSpace(req.Group),
-		Icon:    strings.TrimSpace(req.Icon),
+		Icon:    icon,
 		Level:   strings.TrimSpace(req.Level),
 	})
 	if err != nil {
@@ -80,7 +113,7 @@ func (s *Server) handleTestBarkNotification(c *gin.Context) {
 		c.JSON(http.StatusOK, testBarkResponse{
 			OK:         false,
 			Message:    "测试通知发送失败: " + sendErr.Error(),
-			FailedURLs: result.FailedURLs,
+			FailedURLs: maskedBarkURLs(result.FailedURLs),
 		})
 		return
 	}
