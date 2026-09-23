@@ -66,13 +66,58 @@ sudo systemctl disable --now hideck-qdc507-audio.service
 sudo systemctl enable --now hideck-qdc507-audio-broker.service
 ```
 
-升级 HiDeck 二进制时，保持原容器网络、HTTPS、设备挂载和数据卷不变。**旧容器 entrypoint 等待 ready，必须用新版部署脚本重建为等待 broker socket，否则待机会启动死锁。** 新版脚本仍需按目标机核实 QMI 网卡名称。等待 broker socket 出现后启动 HiDeck 并刷新 Edge。不要再运行临时 `call-scoped-audio-experiment.py`。
+升级 HiDeck 二进制时，保持原容器网络、HTTPS、设备挂载和数据卷不变。**旧容器 entrypoint 等待 ready 或固定网卡名，必须用新版部署脚本重建为只等待 broker socket，否则待机或网卡改名后可能无法启动。** 网卡由设备扫描动态发现。等待 broker socket 出现后启动 HiDeck 并刷新 Edge。不要再运行临时 `call-scoped-audio-experiment.py`。
+
+### USB 热插拔恢复
+
+`hideck-qdc507-hotplug.service` 补充已有 USB 驱动 watcher。旧 watcher 只修正接口归属，不能释放应用中失效的 QMI/AT 句柄或恢复 ADB 发现。新服务仅支持单个 DJI `2ca3:4006`：
+
+1. 每两秒检查 USB 路径、busnum、devnum，要求九个接口和 QMI 网卡完整，驱动归属连续稳定至少六秒。
+2. 等待本次主机启动的 boot-reset 完成，避免与固件重启竞争。
+3. 核对 ADB USB 路径并读取模块 boot ID；失败时重建主机 ADB server，再核对身份。
+4. 停止已运行的 HiDeck 容器后，使用宿主 `qmicli` 独占执行 DMS 查询，避免和应用 QMI client 竞争。若仍超时，核对 ADB 身份后尝试一次模块软件重启，验证 boot ID 变化并等待驱动、ADB 恢复，再重新查询 QMI。
+5. 重启音频 broker、重新启动 HiDeck，丢弃上一代设备的句柄。失败或收到正常停止信号也尝试重新启动原来运行的容器。保留音频 socket 目录、数据库及网络/电话策略。
+6. QMI 查询及 HTTP ping 成功后在 `/run` 记录已处理的 USB 实例；同一实例不重复恢复。失败退避 60 秒再尝试，模块变化则重新等待稳定。接口级重新授权可能不改变 devnum，因此也识别接口消失后重新出现。
+
+不主动启动管理员事先手动停止的容器，不修改防火墙，不自动拨号，也不通过反复重启模块掩盖呼叫失败。模块重启前创建 `/run/hideck-qdc507-hotplug-reset-attempted`；未完整恢复时保留标记，后续尝试不得再次重启模块，包括 supervisor 自身重启后。完整恢复后才清除预算标记。失败后应查看日志，不要无条件删除该标记循环重试。ADB server 重启影响该主机所有 ADB 客户端，因此此服务用于单模块专用主机，宿主需安装 `qmicli`、`adb`、`curl`。QMI 查询和 `ping` 成功不代表 SIM 驻网、短信、数据出口或真人双向通话已经验收。
+
+```sh
+sudo install -m 755 packaging/qdc507/hideck-qdc507-hotplug /usr/local/sbin/
+sudo install -m 644 packaging/qdc507/hideck-qdc507-hotplug.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now hideck-qdc507-hotplug.service
+```
+
+必须先用新版 `deploy-qdc507-host.sh` 重建容器以移除固定网卡名等待条件，保留旧容器但关闭其自动重启以便回滚。初次启用 hotplug 服务会执行一次恢复；应在无通话维护窗口安装。验收应分别记录软件 USB 重新枚举、真实物理插拔、整机重启和真人通话，不能相互替代。
+
+当前恢复服务以本次主机 boot-reset 已成功为前提。若主机启动时未插模块导致 boot-reset 超时，之后首次插入还需管理员启动 boot-reset；这个场景尚未实现完整无人干预恢复。完整 USB 断开会打断当前通话，不保证恢复原通话。维护期间需要手动停止容器时，应先停止 hotplug 服务，避免与正在进行的恢复竞争。
+
+2026-09-23：新增恢复测试九项及原 broker 四项通过。第一轮软件取消授权五秒后重新授权，暴露了“容器 healthy 但 QMI 超时”的不足；随后加入独占 QMI 查询、一次模块重启兜底及重枚举后的 ADB 发现重试。真实物理重新插拔仍待再次验收。部分外呼返回 `NO CARRIER` 后用户确认目标手机有未接记录，不能将其直接归因为拨号未送达；随后重拨成功接听并完成下述延迟听测。撤回此功能时先 `systemctl disable --now hideck-qdc507-hotplug.service`；保留原 USB watcher、boot-reset 和 audio broker。
+
+修订后的第二轮软件断开测试完全未人工介入恢复：supervisor 检测 QMI 超时后自行重启模块一次，验证新 USB 实例和 boot ID，再恢复服务。约 35 秒完成日志中的恢复流程（不含先前枚举等待），设备 API 显示控制在线、蜂窝已注册、电话 ready/registered；独立音频租约测试返回 READY。该结果不替代实际外呼/呼入听测。
 
 重启后的设计流程：USB watch 修正接口绑定 → boot-reset 对已核实身份的模块做一次软件重启 → broker 启动并创建 managed/socket → HiDeck 自动恢复 QMI、短信与 AT 监听 → 来电/外呼进入活动态后按需准备音频。broker 待机不需要 ready 文件；ready 只表示当前路由已启用。
 
 `/run` 是易失目录。必须保证容器挂载的是宿主同一个目录，不要在容器运行时删除再重建它；broker 在启动时创建目录，部署脚本确认 socket 存在后才创建容器。若 USB/ADB 完全失联，服务会报错，不保证免除物理维修。本版本已完成下述温重启真人验收；迁移主机、固件或启动配置后仍需重新验收。
 
 ## 验证与排错
+
+### 接通后的音频准备延迟优化（2026-09-23）
+
+保持“通话 active 后才申请路由”，不提前占用 D4/UAC。移除设备节点检查通过后固定的两秒等待，将五条 UCM 命令的间隔从 0.5 秒缩短为 0.1 秒；仍检查 ACDB 初始化、VocProc 校准、bridge 检查、路由 active 和 audio_enable。runtime 输出阶段耗时，broker 输出清理及完整准备耗时。
+
+同一现场待机租约基线一次 6.779 秒；调整后三次为 2.874、2.367、2.368 秒，均返回 READY。数据仅代表申请路由至 READY，不包括 AT 状态确认、ALSA 打开、浏览器缓冲和真人听感。
+
+随后真实 WebUI 外呼接通时，通过后台通话状态检测（约 150 毫秒查询间隔）立即触发浏览器所在电脑的 `say`，而非等路由 READY 才播放。该通话 broker 记录准备时间 2.372 秒，用户确认接通后约 3 秒开始听到测试语音，体验改善；挂断后路由正常释放。`say` 是现场测试手段，不是生产服务的一部分。该轮仅确认外呼电脑到手机的出声体验，不等于优化后的全部双向音频、呼入、冷启动和真实热插拔首通已验收。
+
+本地资产路径用 systemd drop-in 配置 `QDC507_RUNTIME_DIR`，不要把私有路径写进公共脚本。默认路径是 `/opt/qdc507-voice-runtime`，部署前必须验证目录与资产存在。若固件需要保守节奏，可在 `hideck-qdc507-audio.service` 的 `[Service]` drop-in 设置以下值并 daemon-reload，下一次路由启动生效：
+
+```ini
+Environment=QDC507_DEVICE_SETTLE_SECONDS=2
+Environment=QDC507_UCM_COMMAND_GAP_SECONDS=0.5
+```
+
+优化默认值分别为 `0` 和 `0.1`。不要仅凭 READY 判定音频质量；出现静音或异常应恢复保守配置并重新听测。
 
 ### 固化部署检查记录（2026-09-20）
 
