@@ -7,6 +7,16 @@ state_dir=/run/hideck-qdc507-audio
 adb_bin=/usr/bin/adb
 cal_pid=
 route_pid=
+started_ms=$(date +%s%3N)
+# Retain a deployment escape hatch for firmware requiring conservative pacing.
+device_settle=${QDC507_DEVICE_SETTLE_SECONDS:-0}
+ucm_gap=${QDC507_UCM_COMMAND_GAP_SECONDS:-0.1}
+for delay in "$device_settle" "$ucm_gap"; do
+  [[ "$delay" =~ ^[0-9]+([.][0-9]+)?$ ]] || exit 1
+done
+phase() {
+  printf 'audio_prepare phase=%s elapsed_ms=%s\n' "$1" "$(( $(date +%s%3N) - started_ms ))"
+}
 
 adb_run() {
   local output marker
@@ -48,6 +58,7 @@ f4f6c266ced7015d4e61d993a6e31247c26a9e85a8fdf1c6d842c459e1e2970a  manifest.json
 ed3821682d5309969a01c764192c83feff9669c61ef237c69475cd1619cf296c  qdc507_voice.ko
 88d47c15e61d1428a59c821fed804c2e6490e82859a085062f21966b58d167fc  mavo-pcm-bridge.armv7
 EOF
+phase assets_verified
 
 # This host runtime owns its ADB server. After option releases the ADB
 # interface, an already-running server can retain a missing/offline transport.
@@ -58,6 +69,7 @@ if ! timeout 20 "$adb_bin" wait-for-device; then
 fi
 [[ "$("$adb_bin" shell id -u | tr -d '\r')" == 0 ]]
 [[ "$("$adb_bin" shell uname -r | tr -d '\r')" == 3.18.44 ]]
+phase adb_ready
 
 # A killed adb client does not necessarily terminate its remote child. Always
 # start from one known route and one calibration process after hotplug/restart.
@@ -83,7 +95,8 @@ for _ in {1..100}; do
   sleep 0.2
 done
 adb_run "test -c /dev/msm_audio_cal && test -c /dev/snd/controlC0 && test -c /dev/snd/pcmC0D4p && test -c /dev/snd/pcmC0D4c && test -c /dev/snd/pcmC0D5p && test -c /dev/snd/pcmC0D6c"
-sleep 2
+phase devices_ready
+sleep "$device_settle"
 
 "$adb_bin" shell /usr/bin/alsaucm_test >"$state_dir/calibration.log" 2>&1 &
 cal_pid=$!
@@ -99,6 +112,7 @@ for _ in {1..100}; do
   sleep 0.1
 done
 grep -q 'ACDB -> init done!' "$state_dir/calibration.log"
+phase acdb_initialized
 for command in \
   'open snd_soc_msm_9x07_Tomtom_I2S' \
   'set _verb VoLTE' \
@@ -106,7 +120,7 @@ for command in \
   'set _enadev Auxpcm Tx' \
   'set _enamod Play VoLTE'; do
   adb_run "printf '%s\\n' '$command' > /run/alsaucm_test"
-  sleep 0.5
+  sleep "$ucm_gap"
 done
 for _ in {1..100}; do
   grep -q 'ACDB -> Sent VocProc Cal!' "$state_dir/calibration.log" && break
@@ -114,6 +128,7 @@ for _ in {1..100}; do
   sleep 0.1
 done
 grep -q 'ACDB -> Sent VocProc Cal!' "$state_dir/calibration.log"
+phase voice_calibrated
 adb_run "'$remote_dir/mavo-pcm-bridge.armv7' --check"
 
 "$adb_bin" shell "'$remote_dir/mavo-pcm-bridge.armv7' --voice-route-session --verbose" \
@@ -131,6 +146,7 @@ grep -q 'VoLTE route session active on hw:0,4' "$state_dir/route.log"
 adb_run "test \"\$(cat /sys/class/android_usb/f_audio/audio_enable)\" = 1"
 printf 'ready\n' >"$state_dir/ready.tmp"
 mv "$state_dir/ready.tmp" "$state_dir/ready"
+phase route_ready
 
 # Keep adb shell and the module-side bridge supervised by systemd. Any bridge
 # exit is a service failure and must trigger a clean restart.

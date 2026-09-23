@@ -63,7 +63,9 @@ class Broker:
                 conn.sendall(b"BUSY\n")
                 return
             try:
+                started = time.monotonic()
                 self.clean()
+                log(f"lease preparation cleanup_ms={int((time.monotonic() - started) * 1000)}")
                 if disconnected(conn) or self.stopping.is_set():
                     return
                 self.start()
@@ -76,7 +78,7 @@ class Broker:
                 if disconnected(conn) or self.stopping.is_set():
                     return
                 conn.sendall(b"READY\n")
-                log("lease ready: D4/UAC active")
+                log(f"lease ready: D4/UAC active preparation_ms={int((time.monotonic() - started) * 1000)}")
                 while not self.stopping.wait(0.2):
                     if disconnected(conn):
                         return
