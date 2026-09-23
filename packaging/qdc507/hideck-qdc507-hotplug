@@ -1,0 +1,173 @@
+#!/usr/bin/env python3
+"""Reconcile a single DJI USB generation after driver and boot preparation."""
+import json
+import os
+from pathlib import Path
+import subprocess
+import signal
+import time
+
+USB = Path('/sys/bus/usb/devices')
+MARKER = Path('/run/hideck-qdc507-hotplug.json')
+RESET_MARKER = Path('/run/hideck-qdc507-hotplug-reset-attempted')
+CONTAINER = os.environ.get('HIDECK_CONTAINER', 'hideck')
+
+
+def run(*args, timeout=20):
+    return subprocess.check_output(args, timeout=timeout, stderr=subprocess.STDOUT).decode().strip()
+
+
+def generation(root=USB):
+    found = []
+    for p in root.iterdir():
+        if not (p / 'idVendor').exists() or not (p / 'idProduct').exists():
+            continue
+        try:
+            if (p / 'idVendor').read_text().strip() != '2ca3' or (p / 'idProduct').read_text().strip() != '4006':
+                continue
+            token = (p.name, (p / 'busnum').read_text().strip(), (p / 'devnum').read_text().strip())
+            for n in range(9):
+                interface = p / f'{p.name}:1.{n}'
+                if not interface.exists():
+                    return None
+                driver = (interface / 'driver').resolve().name if (interface / 'driver').exists() else ''
+                expected = {'option'} if n < 4 else {'qmi_wwan'} if n == 4 else {'', 'usbfs'} if n == 5 else {'snd-usb-audio'}
+                if driver not in expected:
+                    return None
+            if not list((p / f'{p.name}:1.4' / 'net').glob('*')):
+                return None
+            found.append(token)
+        except (OSError, ValueError):
+            return None
+    # The audio broker is single-module. Never pick an arbitrary device.
+    return found[0] if len(found) == 1 else None
+
+
+def verify_adb(token):
+    if run('adb', '-d', 'get-devpath') != 'usb:' + token[0]:
+        raise RuntimeError('ADB device does not match the verified DJI USB path')
+    boot = run('adb', '-d', 'shell', 'cat /proc/sys/kernel/random/boot_id').strip()
+    if len(boot) != 36:
+        raise RuntimeError('ADB shell is not ready')
+    return boot
+
+
+def check_qmi(token):
+    controls = list((USB / token[0] / f'{token[0]}:1.4' / 'usbmisc').glob('cdc-wdm*'))
+    if len(controls) != 1:
+        raise RuntimeError('no unique DJI QMI control node')
+    # Caller has stopped HiDeck: do not race its QMI client or serial owner.
+    run('qmicli', '-d', '/dev/' + controls[0].name, '--dms-get-manufacturer', timeout=15)
+
+
+def reset_once(token):
+    old_boot = verify_adb(token)
+    # Persist before issuing reboot. Failed recovery must not cause reboot loops,
+    # including when the supervisor itself is restarted by systemd.
+    with RESET_MARKER.open('x') as f:
+        f.write('QMI recovery reboot attempted\n')
+    run('adb', '-d', 'reboot')
+    deadline = time.monotonic() + 120
+    time.sleep(5)
+    run('adb', 'kill-server')
+    run('adb', 'start-server')
+    candidate, since, next_adb_restart = None, 0, 0
+    while time.monotonic() < deadline:
+        current = generation()
+        if current != candidate:
+            candidate, since = current, time.monotonic()
+        if current and current[0] == token[0] and time.monotonic() - since >= 6:
+            try:
+                if verify_adb(current) != old_boot:
+                    return current
+            except (OSError, subprocess.SubprocessError, RuntimeError):
+                if time.monotonic() >= next_adb_restart:
+                    run('adb', 'kill-server')
+                    run('adb', 'start-server')
+                    next_adb_restart = time.monotonic() + 15
+        time.sleep(2)
+    raise RuntimeError('module reboot could not be verified')
+
+
+def recover(token):
+    if generation() != token:
+        raise RuntimeError('USB generation changed before recovery')
+    # Do not undo an administrator explicitly stopping the container.
+    if run('docker', 'inspect', '-f', '{{.State.Running}}', CONTAINER) != 'true':
+        raise RuntimeError('container is stopped; waiting for administrator')
+    try:
+        verify_adb(token)
+    except (subprocess.SubprocessError, RuntimeError):
+        run('adb', 'kill-server')
+        run('adb', 'start-server')
+        run('adb', '-d', 'wait-for-device', timeout=25)
+        verify_adb(token)
+    if generation() != token:
+        raise RuntimeError('USB generation changed during ADB recovery')
+    # Stop all application QMI owners before a real control-plane probe.
+    run('docker', 'stop', '-t', '12', CONTAINER, timeout=40)
+    try:
+        try:
+            check_qmi(token)
+        except (OSError, subprocess.SubprocessError, RuntimeError):
+            print('QMI probe failed; attempting one verified firmware restart', flush=True)
+            token = reset_once(token)
+            check_qmi(token)
+        run('systemctl', 'restart', 'hideck-qdc507-audio-broker.service', timeout=75)
+        if generation() != token:
+            raise RuntimeError('USB generation changed during service recovery')
+    finally:
+        run('docker', 'start', CONTAINER, timeout=40)
+    run('curl', '--fail', '--silent', '--retry', '8', '--retry-connrefused',
+        '--retry-delay', '2', '--max-time', '3', 'http://127.0.0.1:7575/ping', timeout=45)
+    RESET_MARKER.unlink(missing_ok=True)
+    return token
+
+
+class Debounce:
+    def __init__(self, completed=None):
+        self.completed = completed
+        self.candidate = None
+        self.since = 0
+        self.retry_at = 0
+
+    def due(self, token, now):
+        if token is None:
+            # Interface-only USB reauthorization can reuse busnum/devnum.
+            self.completed = None
+        if token != self.candidate:
+            self.candidate, self.since, self.retry_at = token, now, 0
+        return token is not None and token != self.completed and now - self.since >= 6 and now >= self.retry_at
+
+
+def main():
+    def stop(signum, frame):
+        raise SystemExit(0)
+    signal.signal(signal.SIGTERM, stop)
+    try:
+        completed = tuple(json.loads(MARKER.read_text()))
+    except (OSError, ValueError, TypeError):
+        completed = None
+    state = Debounce(completed)
+    while True:
+        token = generation()
+        now = time.monotonic()
+        # The once-per-host-boot reset owns initial firmware reboot; never race it.
+        if Path('/run/hideck-qdc507-boot-reset.done').exists() and state.due(token, now):
+            try:
+                print(f'recovering USB generation {token}', flush=True)
+                token = recover(token)
+                tmp = MARKER.with_suffix('.tmp')
+                tmp.write_text(json.dumps(token))
+                tmp.replace(MARKER)
+                state.completed = token
+                print(f'service recovery complete for {token}; call test still required', flush=True)
+            except (OSError, subprocess.SubprocessError, RuntimeError) as exc:
+                # Do not print subprocess output: it may contain device identifiers.
+                print(f'recovery not complete: {type(exc).__name__}; retry in 60s', flush=True)
+                state.retry_at = time.monotonic() + 60
+        time.sleep(2)
+
+
+if __name__ == '__main__':
+    main()

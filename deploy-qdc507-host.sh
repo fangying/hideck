@@ -11,11 +11,12 @@ if docker container inspect hideck >/dev/null 2>&1; then
   exit 1
 fi
 
-iface=wwp200s0f3u1i4
-raw_ip="/sys/class/net/$iface/qmi/raw_ip"
-if [ -w "$raw_ip" ]; then
-  printf 'Y' > "$raw_ip"
-fi
+for raw_ip in /sys/class/net/*/qmi/raw_ip; do
+  iface_dir=${raw_ip%/qmi/raw_ip}
+  usb_device="$iface_dir/device/.."
+  [ "$(cat "$usb_device/idVendor" 2>/dev/null):$(cat "$usb_device/idProduct" 2>/dev/null)" = 2ca3:4006 ] || continue
+  [ ! -w "$raw_ip" ] || printf 'Y' > "$raw_ip"
+done
 
 # Host networking keeps Pion ICE on the host UDP socket. The QMI interface
 # remains in the host namespace and is therefore not moved into the container.
@@ -36,6 +37,6 @@ cid=$(docker run -d --name hideck --restart unless-stopped --init --stop-timeout
   --log-driver json-file --log-opt max-size=10m --log-opt max-file=3 \
   --entrypoint /bin/sh \
   yibaiba/hideck@sha256:b46adb1b8679cbc884838c99291c679b879c8e3b0dc2e793f4bf1a70f2295663 \
-  -c 'until [ -e /sys/class/net/wwp200s0f3u1i4 ] && [ -S /run/hideck-qdc507-audio/control.sock ]; do sleep 1; done; exec /usr/local/bin/hideck -c /app/config/config.yaml')
+  -c 'until [ -S /run/hideck-qdc507-audio/control.sock ]; do sleep 1; done; exec /usr/local/bin/hideck -c /app/config/config.yaml')
 
 printf '%s\n' "$cid"

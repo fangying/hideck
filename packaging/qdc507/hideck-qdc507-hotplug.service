@@ -1,0 +1,15 @@
+[Unit]
+Description=Recover HiDeck after DJI QDC507 USB re-enumeration
+Requires=hideck-qdc507-usb.service
+Wants=hideck-qdc507-boot-reset.service docker.service
+After=hideck-qdc507-usb.service hideck-qdc507-boot-reset.service docker.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /usr/local/sbin/hideck-qdc507-hotplug
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=60
+
+[Install]
+WantedBy=multi-user.target
