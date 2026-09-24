@@ -53,15 +53,14 @@ socket 权限为 `0600`，仅适用于当前以 root 运行的 HiDeck 容器。�
 
 ## 安装与重启自恢复
 
+当前统一部署根目录为 `/opt/docker/hideck`。脚本实际文件放在 `host/bin/`，unit 和 udev 规则分别放在 `host/systemd/`、`host/udev/`，系统标准路径仅保留链接。安装器只安装文件并重载配置，不自动重启服务或迁移业务数据。完整目录布局、新安装顺序、旧目录迁移与回滚见 [部署说明](DEPLOYMENT.md)。旧部署须先迁移配置、数据、语音资产并核对 drop-in，不能直接在空的新目录创建容器。
+
 前提：已有 USB 驱动校正、模块 boot-reset 服务，音频资产已安装，HiDeck 挂载运行目录，部署的是包含 `route_lease.go` 的程序。
 
 在无通话的维护窗口，从仓库根目录执行；路径为通用示例：
 
 ```sh
-sudo install -m 755 packaging/qdc507/hideck-qdc507-audio-broker /usr/local/sbin/
-sudo install -m 644 packaging/qdc507/hideck-qdc507-audio-broker.service /etc/systemd/system/
-sudo install -m 644 packaging/qdc507/hideck-qdc507-audio.service /etc/systemd/system/
-sudo systemctl daemon-reload
+sudo bash packaging/qdc507/install-host.sh
 sudo systemctl disable --now hideck-qdc507-audio.service
 sudo systemctl enable --now hideck-qdc507-audio-broker.service
 ```
@@ -82,9 +81,7 @@ sudo systemctl enable --now hideck-qdc507-audio-broker.service
 不主动启动管理员事先手动停止的容器，不修改防火墙，不自动拨号，也不通过反复重启模块掩盖呼叫失败。模块重启前创建 `/run/hideck-qdc507-hotplug-reset-attempted`；未完整恢复时保留标记，后续尝试不得再次重启模块，包括 supervisor 自身重启后。完整恢复后才清除预算标记。失败后应查看日志，不要无条件删除该标记循环重试。ADB server 重启影响该主机所有 ADB 客户端，因此此服务用于单模块专用主机，宿主需安装 `qmicli`、`adb`、`curl`。QMI 查询和 `ping` 成功不代表 SIM 驻网、短信、数据出口或真人双向通话已经验收。
 
 ```sh
-sudo install -m 755 packaging/qdc507/hideck-qdc507-hotplug /usr/local/sbin/
-sudo install -m 644 packaging/qdc507/hideck-qdc507-hotplug.service /etc/systemd/system/
-sudo systemctl daemon-reload
+sudo bash packaging/qdc507/install-host.sh
 sudo systemctl enable --now hideck-qdc507-hotplug.service
 ```
 
@@ -110,7 +107,7 @@ sudo systemctl enable --now hideck-qdc507-hotplug.service
 
 随后真实 WebUI 外呼接通时，通过后台通话状态检测（约 150 毫秒查询间隔）立即触发浏览器所在电脑的 `say`，而非等路由 READY 才播放。该通话 broker 记录准备时间 2.372 秒，用户确认接通后约 3 秒开始听到测试语音，体验改善；挂断后路由正常释放。`say` 是现场测试手段，不是生产服务的一部分。该轮仅确认外呼电脑到手机的出声体验，不等于优化后的全部双向音频、呼入、冷启动和真实热插拔首通已验收。
 
-本地资产路径用 systemd drop-in 配置 `QDC507_RUNTIME_DIR`，不要把私有路径写进公共脚本。默认路径是 `/opt/qdc507-voice-runtime`，部署前必须验证目录与资产存在。若固件需要保守节奏，可在 `hideck-qdc507-audio.service` 的 `[Service]` drop-in 设置以下值并 daemon-reload，下一次路由启动生效：
+本地资产路径用 systemd drop-in 配置 `QDC507_RUNTIME_DIR`，不要把私有路径写进公共脚本。默认路径是 `/opt/docker/hideck/assets/qdc507-voice-runtime`，部署前必须验证目录与资产存在。若固件需要保守节奏，可在 `hideck-qdc507-audio.service` 的 `[Service]` drop-in 设置以下值并 daemon-reload，下一次路由启动生效：
 
 ```ini
 Environment=QDC507_DEVICE_SETTLE_SECONDS=2

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
-hideck_dir=${HIDECK_DIR:-/opt/hideck}
+hideck_dir=${HIDECK_DIR:-/opt/docker/hideck}
 cd "$hideck_dir"
 
 test -x "$PWD/bin/hideck"

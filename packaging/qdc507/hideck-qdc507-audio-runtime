@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-runtime_dir=${QDC507_RUNTIME_DIR:-/opt/qdc507-voice-runtime}
+runtime_dir=${QDC507_RUNTIME_DIR:-/opt/docker/hideck/assets/qdc507-voice-runtime}
 remote_dir=/tmp/modemdeck-qdc507-voice
 state_dir=/run/hideck-qdc507-audio
 adb_bin=/usr/bin/adb

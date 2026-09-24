@@ -39,6 +39,8 @@ HiDeck 是 Go 后端、Vue 前端的蜂窝模组管理服务，提供数据连�
 
 ## 固化组件
 
+生产部署统一位于 `/opt/docker/hideck`：`bin/` 为主程序，`config/ data/ logs/` 为持久文件，`assets/` 为语音资产，`host/` 为宿主脚本与服务配置，`docs/` 为方案副本，`archive/` 为历史和回滚备份。系统目录保留必要的符号链接，`/run` 临时状态和 Docker/系统公共依赖不迁移。安装及旧目录升级步骤见 [统一部署说明](packaging/qdc507/DEPLOYMENT.md)。
+
 | 组件 | 生命周期 |
 | --- | --- |
 | USB watch / boot-reset | 修正 DJI 接口归属；主机启动时执行一次模块软件恢复 |

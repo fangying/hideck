@@ -1,0 +1,3 @@
+# Match the composite device only, not its child interfaces.
+SUBSYSTEM=="usb", ENV{DEVTYPE}=="usb_device", ATTR{idVendor}=="2ca3", ATTR{idProduct}=="4006", ACTION=="add", RUN+="/usr/local/sbin/qdc507-usb-bind.sh %k"
+SUBSYSTEM=="usb", ENV{DEVTYPE}=="usb_device", ATTR{idVendor}=="2c7c", ATTR{idProduct}=="0125", ACTION=="add", RUN+="/usr/local/sbin/qdc507-usb-bind.sh %k"
