@@ -10,6 +10,7 @@ import SwitchDark from '../components/SwitchDark.vue'
 import { t, useLocale } from '../i18n'
 import { nextLocale } from '../utils/locale'
 import PhoneCallBar from '../components/PhoneCallBar.vue'
+import PhoneRingtoneControl from '../components/PhoneRingtoneControl.vue'
 import SmsNotificationCenter from '../components/sms/SmsNotificationCenter.vue'
 import { debugCollector } from '../debug/collector'
 import {
@@ -266,6 +267,7 @@ const activeMenuItem = computed(() => menuItems.value.find((item) => item.index 
             <span class="service-state-dot" />
             <span>{{ t('nav.live') }}</span>
           </div>
+          <PhoneRingtoneControl />
           <SmsNotificationCenter />
           <SwitchDark :is-dark="isDark" @toggle="(e) => emit('toggle-theme', e)" />
         </div>
